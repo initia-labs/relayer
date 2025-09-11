@@ -140,6 +140,14 @@ func (r CometRPCClient) GetABCIQueryWithOptions(ctx context.Context, path string
 	return q, nil
 }
 
+func (r CometRPCClient) GetABCIQueryWithAttestations(ctx context.Context, path string, data bytes.HexBytes, opts rpcclient.ABCIQueryOptions) (*coretypes.ResultABCIQueryWithAttestation, error) {
+	q, err := r.ABCIQueryWithAttestation(ctx, path, data, opts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get ABCI query with attestations: %w", err)
+	}
+	return q, nil
+}
+
 // GetStatus implements ConsensusClient.
 func (r CometRPCClient) GetStatus(ctx context.Context) (*Status, error) {
 	s, err := r.Status(ctx)

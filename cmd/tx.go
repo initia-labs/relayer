@@ -873,6 +873,8 @@ $ %s tx link-then-start demo-path --timeout 5s`, appName, appName)),
 	cmd = processorFlag(a.viper, cmd)
 	cmd = updateTimeFlags(a.viper, cmd)
 	cmd = flushIntervalFlag(a.viper, cmd)
+	cmd = metricsServerFlags(a.viper, cmd)
+	cmd = stuckPacketFlags(a.viper, cmd)
 	return cmd
 }
 

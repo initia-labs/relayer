@@ -16,6 +16,7 @@ import (
 	commitmenttypes "github.com/cosmos/ibc-go/v8/modules/core/23-commitment/types"
 	ibcexported "github.com/cosmos/ibc-go/v8/modules/core/exported"
 	tendermint "github.com/cosmos/ibc-go/v8/modules/light-clients/07-tendermint"
+	ibctmattestor "github.com/initia-labs/initia/x/ibc/light-clients/07-tendermint-attestor"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -60,6 +61,8 @@ type LatestBlock struct {
 type IBCHeader interface {
 	Height() uint64
 	ConsensusState() ibcexported.ConsensusState
+	CometSignedHeader() *types.SignedHeader
+	CometValidatorSet() *types.ValidatorSet
 	NextValidatorsHash() []byte
 }
 
@@ -537,6 +540,14 @@ type TendermintIBCHeader struct {
 	TrustedHeight     clienttypes.Height
 }
 
+func (h TendermintIBCHeader) CometSignedHeader() *types.SignedHeader {
+	return h.SignedHeader
+}
+
+func (h TendermintIBCHeader) CometValidatorSet() *types.ValidatorSet {
+	return h.ValidatorSet
+}
+
 func (h TendermintIBCHeader) Height() uint64 {
 	return uint64(h.SignedHeader.Height)
 }
@@ -569,6 +580,60 @@ func (h TendermintIBCHeader) TMHeader() (*tendermint.Header, error) {
 		ValidatorSet:      valSet,
 		TrustedHeight:     h.TrustedHeight,
 		TrustedValidators: trustedVals,
+	}, nil
+}
+
+type TendermintAttestorIBCHeader struct {
+	SignedHeader      *types.SignedHeader
+	ValidatorSet      *types.ValidatorSet
+	TrustedValidators *types.ValidatorSet
+	TrustedHeight     clienttypes.Height
+}
+
+func (h TendermintAttestorIBCHeader) CometSignedHeader() *types.SignedHeader {
+	return h.SignedHeader
+}
+
+func (h TendermintAttestorIBCHeader) CometValidatorSet() *types.ValidatorSet {
+	return h.ValidatorSet
+}
+
+func (h TendermintAttestorIBCHeader) Height() uint64 {
+	return uint64(h.SignedHeader.Height)
+}
+
+func (h TendermintAttestorIBCHeader) ConsensusState() ibcexported.ConsensusState {
+	return &ibctmattestor.ConsensusState{
+		ConsensusState: &tendermint.ConsensusState{
+			Timestamp:          h.SignedHeader.Time,
+			Root:               commitmenttypes.NewMerkleRoot(h.SignedHeader.AppHash),
+			NextValidatorsHash: h.SignedHeader.NextValidatorsHash,
+		},
+	}
+}
+
+func (h TendermintAttestorIBCHeader) NextValidatorsHash() []byte {
+	return h.SignedHeader.NextValidatorsHash
+}
+
+func (h TendermintAttestorIBCHeader) TMAttestorHeader() (*ibctmattestor.Header, error) {
+	valSet, err := h.ValidatorSet.ToProto()
+	if err != nil {
+		return nil, err
+	}
+
+	trustedVals, err := h.TrustedValidators.ToProto()
+	if err != nil {
+		return nil, err
+	}
+
+	return &ibctmattestor.Header{
+		Header: &tendermint.Header{
+			SignedHeader:      h.SignedHeader.ToProto(),
+			ValidatorSet:      valSet,
+			TrustedHeight:     h.TrustedHeight,
+			TrustedValidators: trustedVals,
+		},
 	}, nil
 }
 

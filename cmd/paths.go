@@ -242,7 +242,6 @@ $ %s paths new ibc-0 ibc-1 demo-path
 $ %s pth n ibc-0 ibc-1 demo-path`, appName, appName)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			src, dst := args[0], args[1]
-
 			return a.performConfigLockingOperation(cmd.Context(), func() error {
 				_, err := a.config.Chains.Gets(src, dst)
 				if err != nil {

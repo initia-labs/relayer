@@ -25,7 +25,6 @@ import (
 	"github.com/cosmos/relayer/v2/cclient"
 	"github.com/cosmos/relayer/v2/relayer/codecs/ethermint"
 	"github.com/cosmos/relayer/v2/relayer/provider"
-	"github.com/strangelove-ventures/cometbft-client/client"
 	"go.uber.org/zap"
 )
 
@@ -349,12 +348,12 @@ func (cc *PenumbraProvider) startLivelinessChecks(ctx context.Context, timeout t
 
 // setRpcClient sets the RPC client for the chain.
 func (cc *PenumbraProvider) setRpcClient(onStartup bool, rpcAddr string, timeout time.Duration) error {
-	c, err := client.NewClient(rpcAddr, timeout)
+	rpchttpClient, err := rpchttp.NewWithTimeout(rpcAddr, "/websocket", uint(timeout))
 	if err != nil {
 		return err
 	}
 
-	cc.ConsensusClient = cclient.NewCometRPCClient(c)
+	cc.ConsensusClient = cclient.NewCometRPCClient(rpchttpClient)
 
 	// Only check status if not on startup, to ensure the relayer will not block on startup.
 	// All subsequent calls will perform the status check to ensure RPC endpoints are rotated

@@ -3,6 +3,7 @@ package processor_test
 import (
 	"testing"
 
+	"github.com/cometbft/cometbft/types"
 	chantypes "github.com/cosmos/ibc-go/v8/modules/core/04-channel/types"
 	ibcexported "github.com/cosmos/ibc-go/v8/modules/core/exported"
 	"github.com/cosmos/relayer/v2/relayer/processor"
@@ -14,6 +15,8 @@ type mockIBCHeader struct{}
 func (h mockIBCHeader) Height() uint64                             { return 0 }
 func (h mockIBCHeader) ConsensusState() ibcexported.ConsensusState { return nil }
 func (h mockIBCHeader) NextValidatorsHash() []byte                 { return nil }
+func (h mockIBCHeader) CometSignedHeader() *types.SignedHeader     { return nil }
+func (h mockIBCHeader) CometValidatorSet() *types.ValidatorSet     { return nil }
 
 func TestIBCHeaderCachePrune(t *testing.T) {
 	cache := make(processor.IBCHeaderCache)

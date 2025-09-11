@@ -12,11 +12,13 @@ import (
 	clienttypes "github.com/cosmos/ibc-go/v8/modules/core/02-client/types"
 	conntypes "github.com/cosmos/ibc-go/v8/modules/core/03-connection/types"
 	chantypes "github.com/cosmos/ibc-go/v8/modules/core/04-channel/types"
+	"github.com/cosmos/ibc-go/v8/modules/core/exported"
 	ibcexported "github.com/cosmos/ibc-go/v8/modules/core/exported"
 	"github.com/cosmos/relayer/v2/cclient"
 	"github.com/cosmos/relayer/v2/relayer/chains"
 	"github.com/cosmos/relayer/v2/relayer/processor"
 	"github.com/cosmos/relayer/v2/relayer/provider"
+	ibctmattestor "github.com/initia-labs/initia/x/ibc/light-clients/07-tendermint-attestor"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 )
@@ -100,16 +102,39 @@ func (l latestClientState) update(ctx context.Context, clientInfo chains.ClientI
 		trustingPeriod = existingClientInfo.TrustingPeriod
 	}
 	if trustingPeriod == 0 {
-		cs, err := ccp.chainProvider.queryTMClientState(ctx, 0, clientInfo.ClientID)
+		clientType, _, err := clienttypes.ParseClientIdentifier(clientInfo.ClientID)
 		if err != nil {
 			ccp.log.Error(
-				"Failed to query client state to get trusting period",
+				"Failed to parse client identifier",
 				zap.String("client_id", clientInfo.ClientID),
 				zap.Error(err),
 			)
 			return
 		}
-		trustingPeriod = cs.TrustingPeriod
+
+		if clientType == ibctmattestor.TendermintAttestor {
+			cs, err := ccp.chainProvider.queryTMAttestorClientState(ctx, 0, clientInfo.ClientID)
+			if err != nil {
+				ccp.log.Error(
+					"Failed to query client state to get trusting period",
+					zap.String("client_id", clientInfo.ClientID),
+					zap.Error(err),
+				)
+				return
+			}
+			trustingPeriod = cs.TrustingPeriod
+		} else {
+			cs, err := ccp.chainProvider.queryTMClientState(ctx, 0, clientInfo.ClientID)
+			if err != nil {
+				ccp.log.Error(
+					"Failed to query client state to get trusting period",
+					zap.String("client_id", clientInfo.ClientID),
+					zap.Error(err),
+				)
+				return
+			}
+			trustingPeriod = cs.TrustingPeriod
+		}
 	}
 	clientState := clientInfo.ClientState(trustingPeriod)
 
@@ -173,8 +198,14 @@ func (ccp *CosmosChainProcessor) clientState(ctx context.Context, clientID strin
 		return state, nil
 	}
 
+	clientType, _, err := clienttypes.ParseClientIdentifier(clientID)
+	if err != nil {
+		return provider.ClientState{}, err
+	}
+
 	var clientState provider.ClientState
-	if clientID == ibcexported.LocalhostClientID {
+	switch clientType {
+	case ibcexported.LocalhostClientID:
 		cs, err := ccp.chainProvider.queryLocalhostClientState(ctx, int64(ccp.latestBlock.Height))
 		if err != nil {
 			return provider.ClientState{}, err
@@ -183,7 +214,17 @@ func (ccp *CosmosChainProcessor) clientState(ctx context.Context, clientID strin
 			ClientID:        clientID,
 			ConsensusHeight: cs.GetLatestHeight().(clienttypes.Height),
 		}
-	} else {
+	case ibctmattestor.TendermintAttestor:
+		cs, err := ccp.chainProvider.queryTMAttestorClientState(ctx, int64(ccp.latestBlock.Height), clientID)
+		if err != nil {
+			return provider.ClientState{}, err
+		}
+		clientState = provider.ClientState{
+			ClientID:        clientID,
+			ConsensusHeight: cs.GetLatestHeight().(clienttypes.Height),
+			TrustingPeriod:  cs.TrustingPeriod,
+		}
+	case exported.Tendermint:
 		cs, err := ccp.chainProvider.queryTMClientState(ctx, int64(ccp.latestBlock.Height), clientID)
 		if err != nil {
 			return provider.ClientState{}, err
@@ -193,6 +234,8 @@ func (ccp *CosmosChainProcessor) clientState(ctx context.Context, clientID strin
 			ConsensusHeight: cs.GetLatestHeight().(clienttypes.Height),
 			TrustingPeriod:  cs.TrustingPeriod,
 		}
+	default:
+		return provider.ClientState{}, fmt.Errorf("invalid client type: %s", clientType)
 	}
 
 	ccp.latestClientState[clientID] = clientState
@@ -384,7 +427,7 @@ func (ccp *CosmosChainProcessor) queryCycle(ctx context.Context, persistence *qu
 
 	ppChanged := false
 
-	var latestHeader provider.TendermintIBCHeader
+	var latestHeader provider.IBCHeader
 
 	newLatestQueriedBlock := persistence.latestQueriedBlock
 
@@ -450,16 +493,15 @@ func (ccp *CosmosChainProcessor) queryCycle(ctx context.Context, persistence *qu
 
 		persistence.retriesAtLatestQueriedBlock = 0
 
-		latestHeader = ibcHeader.(provider.TendermintIBCHeader)
-
 		heightUint64 := uint64(i)
 
+		latestHeader = ibcHeader
 		ccp.latestBlock = provider.LatestBlock{
 			Height: heightUint64,
-			Time:   latestHeader.SignedHeader.Time,
+			Time:   ibcHeader.CometSignedHeader().Time,
 		}
 
-		ibcHeaderCache[heightUint64] = latestHeader
+		ibcHeaderCache[heightUint64] = ibcHeader
 		ppChanged = true
 
 		messages := chains.IbcMessagesFromEvents(ccp.log, blockRes.FinalizeBlockEvents, chainID, heightUint64)

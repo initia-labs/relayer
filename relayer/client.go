@@ -12,6 +12,7 @@ import (
 	ibcexported "github.com/cosmos/ibc-go/v8/modules/core/exported"
 	tmclient "github.com/cosmos/ibc-go/v8/modules/light-clients/07-tendermint"
 	"github.com/cosmos/relayer/v2/relayer/provider"
+	ibctmattestor "github.com/initia-labs/initia/x/ibc/light-clients/07-tendermint-attestor"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 )
@@ -583,6 +584,13 @@ func ClientInfoFromClientState(clientState *codectypes.Any) (ClientStateInfo, er
 
 	switch t := clientStateExported.(type) {
 	case *tmclient.ClientState:
+		return ClientStateInfo{
+			ChainID:        t.ChainId,
+			TrustingPeriod: t.TrustingPeriod,
+			LatestHeight:   t.LatestHeight,
+			UnbondingTime:  t.UnbondingPeriod,
+		}, nil
+	case *ibctmattestor.ClientState:
 		return ClientStateInfo{
 			ChainID:        t.ChainId,
 			TrustingPeriod: t.TrustingPeriod,
