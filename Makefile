@@ -48,6 +48,10 @@ install: go.sum
 	@echo "installing rly binary..."
 	@go build -mod=readonly $(BUILD_FLAGS) -o $(GOBIN)/rly main.go
 
+install-vendor: go.sum
+	@echo "installing rly binary..."
+	@go build -mod=vendor $(BUILD_FLAGS) -o $(GOBIN)/rly main.go
+
 #? build-gaia-docker: Build Docker image for Gaia
 build-gaia-docker:
 	docker build -t cosmos/gaia:$(GAIA_VERSION) --build-arg VERSION=$(GAIA_VERSION) -f ./docker/gaiad/Dockerfile .
