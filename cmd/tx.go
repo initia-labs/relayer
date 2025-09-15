@@ -2,18 +2,22 @@ package cmd
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/avast/retry-go/v4"
+	rpchttp "github.com/cometbft/cometbft/rpc/client/http"
 
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	chantypes "github.com/cosmos/ibc-go/v8/modules/core/04-channel/types"
 	"github.com/cosmos/relayer/v2/relayer"
+	"github.com/cosmos/relayer/v2/relayer/chains/cosmos"
 	"github.com/cosmos/relayer/v2/relayer/processor"
 	"github.com/cosmos/relayer/v2/relayer/provider"
+	ibctmattestor "github.com/initia-labs/initia/x/ibc/light-clients/07-tendermint-attestor"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 )
@@ -671,6 +675,44 @@ $ %s tx connect demo-path --src-port transfer --dst-port transfer --order unorde
 			appName, appName, appName,
 		)),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			err := a.performConfigLockingOperation(cmd.Context(), func() error {
+				for chainName := range a.config.Chains {
+					cp, ok := a.config.Chains[chainName].ChainProvider.(*cosmos.CosmosProvider)
+					if !ok {
+						continue
+					}
+					if cp.PCfg.ClientType == ibctmattestor.TendermintAttestor &&
+						cp.PCfg.AttestorConfiguration != nil {
+						if len(cp.PCfg.AttestorConfiguration.AttestorPubKeys) != len(cp.PCfg.AttestorConfiguration.AttestorRpcAddrs) {
+							cp.PCfg.AttestorConfiguration.AttestorPubKeys = make([]string, len(cp.PCfg.AttestorConfiguration.AttestorRpcAddrs))
+						}
+						for i, attestorRpcAddr := range cp.PCfg.AttestorConfiguration.AttestorRpcAddrs {
+							if cp.PCfg.AttestorConfiguration.AttestorPubKeys[i] == "" {
+								rpchttpClient, err := rpchttp.New(attestorRpcAddr, "/websocket")
+								if err != nil {
+									return err
+								}
+								res, err := rpchttpClient.AttestorPubKey(cmd.Context())
+								if err != nil {
+									return err
+								}
+								cp.PCfg.AttestorConfiguration.AttestorPubKeys[i] = base64.StdEncoding.EncodeToString(res.PubKey)
+								a.log.Info("added attestor",
+									zap.String("chain", chainName),
+									zap.String("attestor_rpc_addr", attestorRpcAddr),
+									zap.String("attestor_pub_key", cp.PCfg.AttestorConfiguration.AttestorPubKeys[i]),
+									zap.Int("index", i),
+								)
+							}
+						}
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				return fmt.Errorf("error adding attestor: %w", err)
+			}
+
 			allowUpdateAfterExpiry, err := cmd.Flags().GetBool(flagUpdateAfterExpiry)
 			if err != nil {
 				return err
