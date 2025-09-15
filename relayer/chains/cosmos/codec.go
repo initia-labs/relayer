@@ -33,6 +33,7 @@ import (
 	"github.com/cosmos/relayer/v2/relayer/chains/cosmos/stride"
 	ethermintcodecs "github.com/cosmos/relayer/v2/relayer/codecs/ethermint"
 	injectivecodecs "github.com/cosmos/relayer/v2/relayer/codecs/injective"
+	ibctmattestor "github.com/initia-labs/initia/x/ibc/light-clients/07-tendermint-attestor"
 )
 
 var ModuleBasics = []module.AppModuleBasic{
@@ -60,6 +61,7 @@ var ModuleBasics = []module.AppModuleBasic{
 	cosmosmodule.AppModuleBasic{},
 	stride.AppModuleBasic{},
 	ibcfee.AppModuleBasic{},
+	ibctmattestor.AppModuleBasic{},
 }
 
 type Codec struct {

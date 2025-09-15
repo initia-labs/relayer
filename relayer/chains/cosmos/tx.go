@@ -2,6 +2,7 @@ package cosmos
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"math"
@@ -50,6 +51,8 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	ibctmattestor "github.com/initia-labs/initia/x/ibc/light-clients/07-tendermint-attestor"
 )
 
 // Variables used for retries
@@ -1057,10 +1060,10 @@ func (cc *CosmosProvider) MsgConnectionOpenTry(msgOpenInit provider.ConnectionIn
 		return nil, err
 	}
 
-	csAny, err := clienttypes.PackClientState(proof.ClientState)
-	if err != nil {
-		return nil, err
-	}
+	// csAny, err := clienttypes.PackClientState(proof.ClientState)
+	// if err != nil {
+	// 	return nil, err
+	// }
 
 	counterparty := conntypes.Counterparty{
 		ClientId:     msgOpenInit.ClientID,
@@ -1071,7 +1074,7 @@ func (cc *CosmosProvider) MsgConnectionOpenTry(msgOpenInit provider.ConnectionIn
 	msg := &conntypes.MsgConnectionOpenTry{
 		ClientId:             msgOpenInit.CounterpartyClientID,
 		PreviousConnectionId: msgOpenInit.CounterpartyConnID,
-		ClientState:          csAny,
+		ClientState:          nil,
 		Counterparty:         counterparty,
 		DelayPeriod:          defaultDelayPeriod,
 		CounterpartyVersions: conntypes.GetCompatibleVersions(),
@@ -1094,16 +1097,16 @@ func (cc *CosmosProvider) MsgConnectionOpenAck(msgOpenTry provider.ConnectionInf
 		return nil, err
 	}
 
-	csAny, err := clienttypes.PackClientState(proof.ClientState)
-	if err != nil {
-		return nil, err
-	}
+	// csAny, err := clienttypes.PackClientState(proof.ClientState)
+	// if err != nil {
+	// 	return nil, err
+	// }
 
 	msg := &conntypes.MsgConnectionOpenAck{
 		ConnectionId:             msgOpenTry.CounterpartyConnID,
 		CounterpartyConnectionId: msgOpenTry.ConnID,
 		Version:                  conntypes.DefaultIBCVersion,
-		ClientState:              csAny,
+		ClientState:              nil,
 		ProofHeight: clienttypes.Height{
 			RevisionNumber: proof.ProofHeight.GetRevisionNumber(),
 			RevisionHeight: proof.ProofHeight.GetRevisionHeight(),
@@ -1300,34 +1303,34 @@ func (cc *CosmosProvider) MsgChannelCloseConfirm(msgCloseInit provider.ChannelIn
 }
 
 func (cc *CosmosProvider) MsgUpdateClientHeader(latestHeader provider.IBCHeader, trustedHeight clienttypes.Height, trustedHeader provider.IBCHeader) (ibcexported.ClientMessage, error) {
-	trustedCosmosHeader, ok := trustedHeader.(provider.TendermintIBCHeader)
-	if !ok {
-		return nil, fmt.Errorf("unsupported IBC trusted header type, expected: TendermintIBCHeader, actual: %T", trustedHeader)
-	}
-
-	latestCosmosHeader, ok := latestHeader.(provider.TendermintIBCHeader)
-	if !ok {
-		return nil, fmt.Errorf("unsupported IBC header type, expected: TendermintIBCHeader, actual: %T", latestHeader)
-	}
-
-	trustedValidatorsProto, err := trustedCosmosHeader.ValidatorSet.ToProto()
+	trustedValidatorsProto, err := trustedHeader.CometValidatorSet().ToProto()
 	if err != nil {
 		return nil, fmt.Errorf("error converting trusted validators to proto object: %w", err)
 	}
 
-	signedHeaderProto := latestCosmosHeader.SignedHeader.ToProto()
+	signedHeaderProto := latestHeader.CometSignedHeader().ToProto()
 
-	validatorSetProto, err := latestCosmosHeader.ValidatorSet.ToProto()
+	validatorSetProto, err := latestHeader.CometValidatorSet().ToProto()
 	if err != nil {
 		return nil, fmt.Errorf("error converting validator set to proto object: %w", err)
 	}
 
-	return &tmclient.Header{
+	var header ibcexported.ClientMessage
+	tmHeader := &tmclient.Header{
 		SignedHeader:      signedHeaderProto,
 		ValidatorSet:      validatorSetProto,
 		TrustedValidators: trustedValidatorsProto,
 		TrustedHeight:     trustedHeight,
-	}, nil
+	}
+	if cc.IsAttestor() {
+		header = &ibctmattestor.Header{
+			Header: tmHeader,
+		}
+	} else {
+		header = tmHeader
+	}
+
+	return header, nil
 }
 
 func (cc *CosmosProvider) QueryICQWithProof(ctx context.Context, path string, request []byte, height uint64) (provider.ICQProof, error) {
@@ -1483,10 +1486,19 @@ func (cc *CosmosProvider) QueryIBCHeader(ctx context.Context, h int64) (provider
 		return nil, err
 	}
 
-	return provider.TendermintIBCHeader{
-		SignedHeader: lightBlock.SignedHeader,
-		ValidatorSet: lightBlock.ValidatorSet,
-	}, nil
+	var ibcHeader provider.IBCHeader
+	if cc.IsAttestor() {
+		ibcHeader = provider.TendermintAttestorIBCHeader{
+			SignedHeader: lightBlock.SignedHeader,
+			ValidatorSet: lightBlock.ValidatorSet,
+		}
+	} else {
+		ibcHeader = provider.TendermintIBCHeader{
+			SignedHeader: lightBlock.SignedHeader,
+			ValidatorSet: lightBlock.ValidatorSet,
+		}
+	}
+	return ibcHeader, nil
 }
 
 // InjectTrustedFields injects the necessary trusted fields for a header to update a light
@@ -1566,6 +1578,26 @@ func (cc *CosmosProvider) queryTMClientState(ctx context.Context, srch int64, sr
 	return clientState, nil
 }
 
+func (cc *CosmosProvider) queryTMAttestorClientState(ctx context.Context, srch int64, srcClientId string) (*ibctmattestor.ClientState, error) {
+	clientStateRes, err := cc.QueryClientStateResponse(ctx, srch, srcClientId)
+	if err != nil {
+		return &ibctmattestor.ClientState{}, err
+	}
+
+	clientStateExported, err := clienttypes.UnpackClientState(clientStateRes.ClientState)
+	if err != nil {
+		return &ibctmattestor.ClientState{}, err
+	}
+
+	clientState, ok := clientStateExported.(*ibctmattestor.ClientState)
+	if !ok {
+		return &ibctmattestor.ClientState{},
+			fmt.Errorf("error when casting exported clientstate to tendermint type, got(%T)", clientStateExported)
+	}
+
+	return clientState, nil
+}
+
 // queryLocalhostClientState retrieves the latest consensus state for a client in state at a given height
 // and unpacks/cast it to localhost client state.
 func (cc *CosmosProvider) queryLocalhostClientState(ctx context.Context, srch int64) (*localhost.ClientState, error) {
@@ -1601,10 +1633,12 @@ func (cc *CosmosProvider) NewClientState(
 	allowUpdateAfterExpiry,
 	allowUpdateAfterMisbehaviour bool,
 ) (ibcexported.ClientState, error) {
+	var clientState ibcexported.ClientState
+
 	revisionNumber := clienttypes.ParseChainID(dstChainID)
 
 	// Create the ClientState we want on 'c' tracking 'dst'
-	return &tmclient.ClientState{
+	tmClientState := &tmclient.ClientState{
 		ChainId:         dstChainID,
 		TrustLevel:      tmclient.NewFractionFromTm(light.DefaultTrustLevel),
 		TrustingPeriod:  dstTrustingPeriod,
@@ -1619,7 +1653,32 @@ func (cc *CosmosProvider) NewClientState(
 		UpgradePath:                  defaultUpgradePath,
 		AllowUpdateAfterExpiry:       allowUpdateAfterExpiry,
 		AllowUpdateAfterMisbehaviour: allowUpdateAfterMisbehaviour,
-	}, nil
+	}
+
+	if cc.IsAttestor() {
+		if cc.PCfg.AttestorConfiguration == nil {
+			cc.PCfg.AttestorConfiguration = &AttestorConfiguration{}
+		}
+
+		attestorPubKeys := make([][]byte, len(cc.PCfg.AttestorConfiguration.AttestorPubKeys))
+		for i, pubKeyStr := range cc.PCfg.AttestorConfiguration.AttestorPubKeys {
+			pubKey, err := base64.StdEncoding.DecodeString(pubKeyStr)
+			if err != nil {
+				return nil, err
+			}
+			attestorPubKeys[i] = pubKey
+		}
+
+		clientState = &ibctmattestor.ClientState{
+			ClientState:     tmClientState,
+			AttestorPubkeys: attestorPubKeys,
+			Threshold:       cc.AttestorThreshold(),
+		}
+	} else {
+		clientState = tmClientState
+	}
+
+	return clientState, nil
 }
 
 func (cc *CosmosProvider) UpdateFeesSpent(chain, key, address string, fees sdk.Coins, dynamicFee string) {
@@ -1861,6 +1920,69 @@ func (cc *CosmosProvider) QueryABCI(ctx context.Context, req abci.RequestQuery) 
 	}
 
 	return result.Response, nil
+}
+
+func (cc *CosmosProvider) QueryABCIWithAttestations(ctx context.Context, req abci.RequestQuery) (abci.ResponseQuery, []*ibctmattestor.Attestation, error) {
+	opts := client2.ABCIQueryOptions{
+		Height: req.Height,
+	}
+
+	wg := sync.WaitGroup{}
+	results := make([]*coretypes.ResultABCIQueryWithAttestation, len(cc.AttestationClients))
+	getAttestationFunc := func(client cclient.AttestationClient, res **coretypes.ResultABCIQueryWithAttestation) {
+		defer wg.Done()
+
+		result, err := client.ABCIQueryWithAttestation(ctx, req.Path, req.Data, opts)
+		if err != nil || !result.Response.IsOK() {
+			return
+		}
+
+		*res = result
+	}
+
+	for i := range cc.AttestationClients {
+		wg.Add(1)
+		go getAttestationFunc(cc.AttestationClients[i], &results[i])
+	}
+
+	wg.Wait()
+
+	consensusResults := make(map[string][]*coretypes.ResultABCIQueryWithAttestation)
+	for i, result := range results {
+		if result == nil {
+			cc.log.Info("failed to get attestation", zap.Int("attestor", i), zap.String("rpc address", cc.PCfg.AttestorConfiguration.AttestorRpcAddrs[i]))
+			continue
+		}
+		opsBz, err := result.Response.ProofOps.Marshal()
+		if err != nil {
+			cc.log.Info("failed to marshal proof ops", zap.Error(err), zap.Int("attestor", i), zap.String("rpc address", cc.PCfg.AttestorConfiguration.AttestorRpcAddrs[i]))
+			continue
+		}
+
+		consensusResults[string(opsBz)] = append(consensusResults[string(opsBz)], result)
+	}
+
+	maxConsensus := 0
+	var maxConsensusResults []*coretypes.ResultABCIQueryWithAttestation
+	for opsBz := range consensusResults {
+		if len(consensusResults[opsBz]) > maxConsensus {
+			maxConsensus = len(consensusResults[opsBz])
+			maxConsensusResults = consensusResults[opsBz]
+		}
+	}
+
+	attestations := make([]*ibctmattestor.Attestation, 0, len(maxConsensusResults))
+	for _, result := range maxConsensusResults {
+		attestations = append(attestations, &ibctmattestor.Attestation{
+			Signature: result.Attestation,
+			PubKey:    result.PubKey,
+		})
+	}
+
+	if uint32(len(attestations)) < cc.AttestorThreshold() {
+		return abci.ResponseQuery{}, nil, fmt.Errorf("not enough attestations, got %d, expected %d", len(attestations), cc.AttestorThreshold())
+	}
+	return maxConsensusResults[0].Response, attestations, nil
 }
 
 func sdkErrorToGRPCError(resp abci.ResponseQuery) error {

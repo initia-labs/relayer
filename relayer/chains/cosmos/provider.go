@@ -23,7 +23,7 @@ import (
 	"github.com/cosmos/relayer/v2/relayer/codecs/ethermint"
 	"github.com/cosmos/relayer/v2/relayer/processor"
 	"github.com/cosmos/relayer/v2/relayer/provider"
-	"github.com/strangelove-ventures/cometbft-client/client"
+	ibctmattestor "github.com/initia-labs/initia/x/ibc/light-clients/07-tendermint-attestor"
 	"go.uber.org/zap"
 )
 
@@ -62,6 +62,10 @@ type CosmosProviderConfig struct {
 
 	// If FeeGrantConfiguration is set, TXs submitted by the ChainClient will be signed by the FeeGrantees in a round-robin fashion by default.
 	FeeGrants *FeeGrantConfiguration `json:"feegrants" yaml:"feegrants"`
+
+	ClientType string `json:"client-type" yaml:"client-type"`
+	// AttestorConfiguation is only valid if ClientType is "07-tendermint-attestor"
+	AttestorConfiguration *AttestorConfiguration `json:"attestor-configuration" yaml:"attestor-configuration"`
 }
 
 // By default, TXs will be signed by the feegrantees 'ManagedGrantees' keys in a round robin fashion.
@@ -78,6 +82,12 @@ type FeeGrantConfiguration struct {
 	BlockHeightVerified int64 `json:"block_last_verified" yaml:"block_last_verified"`
 	// Index of the last ManagedGrantee used as a TX signer
 	GranteeLastSignerIndex int
+}
+
+type AttestorConfiguration struct {
+	AttestorRpcAddrs []string `json:"attestor_rpc_addrs" yaml:"attestor_rpc_addrs"`
+	AttestorPubKeys  []string `json:"attestor_pub_keys" yaml:"attestor_pub_keys"`
+	Threshold        uint32   `json:"threshold" yaml:"threshold"`
 }
 
 func (pc CosmosProviderConfig) Validate() error {
@@ -124,14 +134,15 @@ func (pc CosmosProviderConfig) NewProvider(log *zap.Logger, homepath string, deb
 type CosmosProvider struct {
 	log *zap.Logger
 
-	PCfg            CosmosProviderConfig
-	Keybase         keyring.Keyring
-	KeyringOptions  []keyring.Option
-	ConsensusClient cclient.ConsensusClient
-	LightProvider   provtypes.Provider
-	Input           io.Reader
-	Output          io.Writer
-	Cdc             Codec
+	PCfg               CosmosProviderConfig
+	Keybase            keyring.Keyring
+	KeyringOptions     []keyring.Option
+	ConsensusClient    cclient.ConsensusClient
+	AttestationClients []cclient.AttestationClient
+	LightProvider      provtypes.Provider
+	Input              io.Reader
+	Output             io.Writer
+	Cdc                Codec
 	// TODO: GRPC Client type?
 
 	//nextAccountSeq uint64
@@ -174,6 +185,31 @@ func (cc *CosmosProvider) ChainName() string {
 
 func (cc *CosmosProvider) Type() string {
 	return "cosmos"
+}
+
+func (cc *CosmosProvider) IsAttestor() bool {
+	return cc.PCfg.ClientType == ibctmattestor.TendermintAttestor
+}
+
+func (cc *CosmosProvider) AttestorPubKeys() []string {
+	if cc.PCfg.AttestorConfiguration == nil {
+		return nil
+	}
+	return cc.PCfg.AttestorConfiguration.AttestorPubKeys
+}
+
+func (cc *CosmosProvider) AttestorThreshold() uint32 {
+	if cc.PCfg.AttestorConfiguration == nil {
+		return 0
+	}
+	return cc.PCfg.AttestorConfiguration.Threshold
+}
+
+func (cc *CosmosProvider) AttestorRpcAddrs() []string {
+	if cc.PCfg.AttestorConfiguration == nil {
+		return nil
+	}
+	return cc.PCfg.AttestorConfiguration.AttestorRpcAddrs
 }
 
 func (cc *CosmosProvider) Key() string {
@@ -310,6 +346,11 @@ func (cc *CosmosProvider) Init(ctx context.Context) error {
 		return err
 	}
 
+	err = cc.setAttestationClients(cc.AttestorRpcAddrs(), timeout)
+	if err != nil {
+		return err
+	}
+
 	// set the light client provider
 	err = cc.setLightProvider(cc.PCfg.RPCAddr)
 	if err != nil {
@@ -396,12 +437,12 @@ func (cc *CosmosProvider) startLivelinessChecks(ctx context.Context, timeout tim
 
 // setRpcClient sets the RPC client for the chain.
 func (cc *CosmosProvider) setRpcClient(onStartup bool, rpcAddr string, timeout time.Duration) error {
-	c, err := client.NewClient(rpcAddr, timeout)
+	rpchttpClient, err := rpchttp.NewWithTimeout(rpcAddr, "/websocket", uint(timeout))
 	if err != nil {
 		return err
 	}
 
-	cc.ConsensusClient = cclient.NewCometRPCClient(c)
+	cc.ConsensusClient = cclient.NewCometRPCClient(rpchttpClient)
 
 	// Only check status if not on startup, to ensure the relayer will not block on startup.
 	// All subsequent calls will perform the status check to ensure RPC endpoints are rotated
@@ -423,6 +464,20 @@ func (cc *CosmosProvider) setLightProvider(rpcAddr string) error {
 	}
 
 	cc.LightProvider = lightprovider
+	return nil
+}
+
+func (cc *CosmosProvider) setAttestationClients(rpcAddrs []string, timeout time.Duration) error {
+	cc.AttestationClients = make([]cclient.AttestationClient, len(rpcAddrs))
+
+	for i := range rpcAddrs {
+		rpchttpClient, err := rpchttp.NewWithTimeout(rpcAddrs[i], "/websocket", uint(timeout))
+		if err != nil {
+			return err
+		}
+
+		cc.AttestationClients[i] = cclient.NewCometRPCClient(rpchttpClient)
+	}
 	return nil
 }
 

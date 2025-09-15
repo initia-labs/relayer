@@ -35,6 +35,7 @@ import (
 	"github.com/cosmos/relayer/v2/cclient"
 	"github.com/cosmos/relayer/v2/relayer/chains"
 	"github.com/cosmos/relayer/v2/relayer/provider"
+	ibctmattestor "github.com/initia-labs/initia/x/ibc/light-clients/07-tendermint-attestor"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/metadata"
@@ -411,25 +412,52 @@ func (cc *CosmosProvider) QueryTendermintProof(ctx context.Context, height int64
 		Prove:  true,
 	}
 
-	res, err := cc.QueryABCI(ctx, req)
-	if err != nil {
-		return nil, nil, clienttypes.Height{}, err
-	}
-
-	merkleProof, err := commitmenttypes.ConvertProofs(res.ProofOps)
-	if err != nil {
-		return nil, nil, clienttypes.Height{}, err
-	}
-
-	cdc := codec.NewProtoCodec(cc.Cdc.InterfaceRegistry)
-
-	proofBz, err := cdc.Marshal(&merkleProof)
+	res, proofBz, err := cc.QueryABCIWithProofs(ctx, req)
 	if err != nil {
 		return nil, nil, clienttypes.Height{}, err
 	}
 
 	revision := clienttypes.ParseChainID(cc.PCfg.ChainID)
 	return res.Value, proofBz, clienttypes.NewHeight(revision, uint64(res.Height)+1), nil
+}
+
+func (cc *CosmosProvider) QueryABCIWithProofs(ctx context.Context, req abci.RequestQuery) (abci.ResponseQuery, []byte, error) {
+	var res abci.ResponseQuery
+	var attestations []*ibctmattestor.Attestation
+	var err error
+
+	if cc.IsAttestor() && cc.AttestorThreshold() > 0 {
+		res, attestations, err = cc.QueryABCIWithAttestations(ctx, req)
+	} else {
+		res, err = cc.QueryABCI(ctx, req)
+	}
+	if err != nil {
+		return abci.ResponseQuery{}, nil, err
+	}
+
+	merkleProof, err := commitmenttypes.ConvertProofs(res.ProofOps)
+	if err != nil {
+		return abci.ResponseQuery{}, nil, err
+	}
+
+	cdc := codec.NewProtoCodec(cc.Cdc.InterfaceRegistry)
+
+	proofBz, err := cdc.Marshal(&merkleProof)
+	if err != nil {
+		return abci.ResponseQuery{}, nil, err
+	}
+
+	if cc.IsAttestor() {
+		MerkleProofBytesWithAttestations := ibctmattestor.MerkleProofBytesWithAttestations{
+			ProofBytes:   proofBz,
+			Attestations: attestations,
+		}
+		proofBz, err = cdc.Marshal(&MerkleProofBytesWithAttestations)
+		if err != nil {
+			return abci.ResponseQuery{}, nil, err
+		}
+	}
+	return res, proofBz, nil
 }
 
 // QueryClientStateResponse retrieves the latest consensus state for a client in state at a given height
@@ -517,22 +545,14 @@ func (cc *CosmosProvider) QueryClientConsensusState(ctx context.Context, chainHe
 // QueryUpgradeProof performs an abci query with the given key and returns the proto encoded merkle proof
 // for the query and the height at which the proof will succeed on a tendermint verifier.
 func (cc *CosmosProvider) QueryUpgradeProof(ctx context.Context, key []byte, height uint64) ([]byte, clienttypes.Height, error) {
-	res, err := cc.QueryABCI(ctx, abci.RequestQuery{
+	req := abci.RequestQuery{
 		Path:   "store/upgrade/key",
 		Height: int64(height - 1),
 		Data:   key,
 		Prove:  true,
-	})
-	if err != nil {
-		return nil, clienttypes.Height{}, err
 	}
 
-	merkleProof, err := commitmenttypes.ConvertProofs(res.ProofOps)
-	if err != nil {
-		return nil, clienttypes.Height{}, err
-	}
-
-	proof, err := cc.Cdc.Marshaler.Marshal(&merkleProof)
+	res, proof, err := cc.QueryABCIWithProofs(ctx, req)
 	if err != nil {
 		return nil, clienttypes.Height{}, err
 	}

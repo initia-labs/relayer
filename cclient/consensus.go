@@ -92,3 +92,7 @@ type ResultBroadcastTx struct {
 	Codespace string         `json:"codespace"`
 	Hash      bytes.HexBytes `json:"hash"`
 }
+
+type AttestationClient interface {
+	ABCIQueryWithAttestation(ctx context.Context, path string, data bytes.HexBytes, opts rpcclient.ABCIQueryOptions) (*coretypes.ResultABCIQueryWithAttestation, error)
+}
