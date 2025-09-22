@@ -94,6 +94,7 @@ type IBCMessagesCache struct {
 	PacketState         ChannelPacketStateCache
 	ConnectionHandshake ConnectionMessagesCache
 	ChannelHandshake    ChannelMessagesCache
+	ChannelUpgrade      ChannelMessagesCache
 	ClientICQ           ClientICQMessagesCache
 }
 
@@ -103,11 +104,13 @@ func (c IBCMessagesCache) Clone() IBCMessagesCache {
 		PacketFlow:          make(ChannelPacketMessagesCache, len(c.PacketFlow)),
 		ConnectionHandshake: make(ConnectionMessagesCache, len(c.ConnectionHandshake)),
 		ChannelHandshake:    make(ChannelMessagesCache, len(c.ChannelHandshake)),
+		ChannelUpgrade:      make(ChannelMessagesCache, len(c.ChannelUpgrade)),
 		ClientICQ:           make(ClientICQMessagesCache, len(c.ClientICQ)),
 	}
 	x.PacketFlow.Merge(c.PacketFlow)
 	x.ConnectionHandshake.Merge(c.ConnectionHandshake)
 	x.ChannelHandshake.Merge(c.ChannelHandshake)
+	x.ChannelUpgrade.Merge(c.ChannelUpgrade)
 	x.ClientICQ.Merge(c.ClientICQ)
 	return x
 }
@@ -119,6 +122,7 @@ func NewIBCMessagesCache() IBCMessagesCache {
 		PacketState:         make(ChannelPacketStateCache),
 		ConnectionHandshake: make(ConnectionMessagesCache),
 		ChannelHandshake:    make(ChannelMessagesCache),
+		ChannelUpgrade:      make(ChannelMessagesCache),
 		ClientICQ:           make(ClientICQMessagesCache),
 	}
 }

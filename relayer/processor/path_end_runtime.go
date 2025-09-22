@@ -60,6 +60,8 @@ type pathEndRuntime struct {
 
 	finishedProcessing chan messageToTrack
 	retryCount         uint64
+
+	upgradeTimeout map[ChannelKey]time.Time
 }
 
 func newPathEndRuntime(log *zap.Logger, pathEnd PathEnd, metrics *PrometheusMetrics) *pathEndRuntime {
@@ -83,6 +85,7 @@ func newPathEndRuntime(log *zap.Logger, pathEnd PathEnd, metrics *PrometheusMetr
 		clientICQProcessing:  newClientICQProcessingCache(),
 		connSubscribers:      make(map[string][]func(provider.ConnectionInfo)),
 		metrics:              metrics,
+		upgradeTimeout:       make(map[ChannelKey]time.Time),
 	}
 }
 
@@ -156,6 +159,7 @@ func (pathEnd *pathEndRuntime) mergeMessageCache(
 	packetMessages := make(ChannelPacketMessagesCache)
 	connectionHandshakeMessages := make(ConnectionMessagesCache)
 	channelHandshakeMessages := make(ChannelMessagesCache)
+	channelUpgradeMessages := make(ChannelMessagesCache)
 	clientICQMessages := make(ClientICQMessagesCache)
 
 	messageCache.PacketState.Prune(100) // Only keep most recent 100 packet states per channel
@@ -253,6 +257,22 @@ func (pathEnd *pathEndRuntime) mergeMessageCache(
 		channelHandshakeMessages[eventType] = newCmc
 	}
 	pathEnd.messageCache.ChannelHandshake.Merge(channelHandshakeMessages)
+
+	for eventType, cmc := range messageCache.ChannelUpgrade {
+		newCmc := make(ChannelMessageCache)
+		for k, ci := range cmc {
+			if !pathEnd.isRelevantChannel(k.ChannelID) {
+				continue
+			}
+			newCmc[k] = ci
+		}
+		if len(newCmc) == 0 {
+			continue
+		}
+
+		channelUpgradeMessages[eventType] = newCmc
+	}
+	pathEnd.messageCache.ChannelUpgrade.Merge(channelUpgradeMessages)
 
 	for icqType, cm := range messageCache.ClientICQ {
 		newCache := make(ClientICQMessageCache)
@@ -719,7 +739,7 @@ func (pathEnd *pathEndRuntime) shouldSendConnectionMessage(message connectionIBC
 
 // shouldSendChannelMessage determines if the channel handshake message should be sent now.
 // It will also determine if the message needs to be given up on entirely and remove retention if so.
-func (pathEnd *pathEndRuntime) shouldSendChannelMessage(message channelIBCMessage, counterparty *pathEndRuntime) bool {
+func (pathEnd *pathEndRuntime) shouldSendChannelMessage(message channelIBCMessage, counterparty *pathEndRuntime, checkingHeight bool) bool {
 	eventType := message.eventType
 	channelKey := ChannelInfoChannelKey(message.info)
 	if eventType != chantypes.EventTypeChannelOpenInit {
@@ -732,7 +752,7 @@ func (pathEnd *pathEndRuntime) shouldSendChannelMessage(message channelIBCMessag
 		counterparty.channelOrderCache[channelKey.CounterpartyChannelID] = message.info.Order
 	}
 
-	if message.info.Height >= counterparty.latestBlock.Height {
+	if checkingHeight && message.info.Height >= counterparty.latestBlock.Height {
 		pathEnd.log.Debug("Waiting to relay channel message until counterparty height has incremented",
 			zap.Inline(channelKey),
 			zap.String("event_type", eventType),
@@ -814,6 +834,26 @@ func (pathEnd *pathEndRuntime) shouldSendChannelMessage(message channelIBCMessag
 					}
 				}
 			}
+		case chantypes.EventTypeChannelUpgradeTry:
+			toDeleteCounterparty[chantypes.EventTypeChannelUpgradeInit] = []ChannelKey{counterpartyKey}
+		case chantypes.EventTypeChannelUpgradeAck:
+			toDeleteCounterparty[chantypes.EventTypeChannelUpgradeTry] = []ChannelKey{counterpartyKey}
+			toDelete[chantypes.EventTypeChannelUpgradeInit] = []ChannelKey{channelKey}
+		case chantypes.EventTypeChannelUpgradeConfirm:
+			toDeleteCounterparty[chantypes.EventTypeChannelUpgradeAck] = []ChannelKey{counterpartyKey}
+			toDelete[chantypes.EventTypeChannelUpgradeTry] = []ChannelKey{channelKey}
+			toDeleteCounterparty[chantypes.EventTypeChannelUpgradeInit] = []ChannelKey{counterpartyKey}
+		case chantypes.EventTypeChannelUpgradeOpen:
+			toDeleteCounterparty[chantypes.EventTypeChannelUpgradeConfirm] = []ChannelKey{counterpartyKey}
+			toDelete[chantypes.EventTypeChannelUpgradeAck] = []ChannelKey{channelKey}
+			toDeleteCounterparty[chantypes.EventTypeChannelUpgradeTry] = []ChannelKey{counterpartyKey}
+			toDelete[chantypes.EventTypeChannelUpgradeInit] = []ChannelKey{channelKey}
+		case chantypes.EventTypeChannelUpgradeTimeout, chantypes.EventTypeChannelUpgradeCancel:
+			toDelete[chantypes.EventTypeChannelUpgradeOpen] = []ChannelKey{channelKey}
+			toDeleteCounterparty[chantypes.EventTypeChannelUpgradeConfirm] = []ChannelKey{counterpartyKey}
+			toDelete[chantypes.EventTypeChannelUpgradeAck] = []ChannelKey{channelKey}
+			toDeleteCounterparty[chantypes.EventTypeChannelUpgradeTry] = []ChannelKey{counterpartyKey}
+			toDelete[chantypes.EventTypeChannelUpgradeInit] = []ChannelKey{channelKey}
 		}
 
 		// delete in progress send for this specific message

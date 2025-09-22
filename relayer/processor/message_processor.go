@@ -366,7 +366,8 @@ func (mp *messageProcessor) trackAndSendMessages(
 	}
 
 	// only msgUpdateClient, don't need to send
-	return errors.New("all messages failed to assemble")
+	// return errors.New("all messages failed to assemble")
+	return nil
 }
 
 // sendClientUpdate will send an isolated client update message.

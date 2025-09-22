@@ -64,7 +64,9 @@ func (ccp *CosmosChainProcessor) handlePacketMessage(eventType string, pi provid
 }
 
 func (ccp *CosmosChainProcessor) handleChannelMessage(eventType string, ci provider.ChannelInfo, ibcMessagesCache processor.IBCMessagesCache) {
-	ccp.channelConnections[ci.ChannelID] = ci.ConnID
+	if ci.ConnID != "" {
+		ccp.channelConnections[ci.ChannelID] = ci.ConnID
+	}
 	channelKey := processor.ChannelInfoChannelKey(ci)
 
 	if eventType == chantypes.EventTypeChannelOpenInit {
@@ -95,12 +97,30 @@ func (ccp *CosmosChainProcessor) handleChannelMessage(eventType string, ci provi
 					break
 				}
 			}
+		case chantypes.EventTypeChannelUpgradeInit, chantypes.EventTypeChannelUpgradeTimeout, chantypes.EventTypeChannelUpgradeCancel:
+			ci.CounterpartyConnectionHop0 = ccp.counterpartyConnectionId[ci.ConnectionHop0]
+			ccp.logChannelUpgradeMessage(eventType, ci)
+		case chantypes.EventTypeChannelUpgradeTry, chantypes.EventTypeChannelUpgradeAck:
+			ci.CounterpartyConnectionHop0 = ccp.counterpartyConnectionId[ci.ConnectionHop0]
+			ccp.logChannelUpgradeMessage(eventType, ci)
+			ccp.triggerFlushForUpgrade(channelKey)
+		case chantypes.EventTypeChannelUpgradeOpen:
+			ccp.channelConnections[ci.ChannelID] = ci.ConnectionHop0
+			ccp.logChannelUpgradeMessage(eventType, ci)
+		case chantypes.EventTypeChannelUpgradeConfirm:
+			ccp.logChannelUpgradeMessage(eventType, ci)
+		case chantypes.EventTypeChannelUpgradeError:
+			ccp.logChannelUpgradeMessage(eventType, ci)
 		}
 		// Clear out MsgInitKeys once we have the counterparty channel ID
 		delete(ccp.channelStateCache, channelKey.MsgInitKey())
 	}
 
-	ibcMessagesCache.ChannelHandshake.Retain(channelKey, eventType, ci)
+	if isChannelUpgradeEvent(eventType) {
+		ibcMessagesCache.ChannelUpgrade.Retain(channelKey, eventType, ci)
+	} else {
+		ibcMessagesCache.ChannelHandshake.Retain(channelKey, eventType, ci)
+	}
 
 	ccp.logChannelMessage(eventType, ci)
 }
@@ -192,6 +212,52 @@ func (ccp *CosmosChainProcessor) logChannelOpenMessage(message string, ci provid
 		zap.String("port_id", ci.PortID),
 	}
 	ccp.log.Info("Successfully created new channel", fields...)
+}
+
+func (ccp *CosmosChainProcessor) logChannelUpgradeMessage(message string, ci provider.ChannelInfo) {
+	fields := []zap.Field{
+		zap.String("port_id", ci.PortID),
+		zap.String("channel_id", ci.ChannelID),
+		zap.String("counterparty_port_id", ci.CounterpartyPortID),
+		zap.String("counterparty_channel_id", ci.CounterpartyChannelID),
+		zap.Uint64("upgrade_sequence", ci.UpgradeSequence),
+		zap.String("ordering", ci.Upgrade.Fields.Ordering.String()),
+		zap.String("version", ci.Upgrade.Fields.Version),
+		zap.String("connection_hop0", ci.ConnectionHop0),
+		zap.String("counterparty_connection_hop0", ci.CounterpartyConnectionHop0),
+		zap.String("upgrade_error", ci.UpgradeError),
+	}
+	if len(ci.Upgrade.Fields.ConnectionHops) > 0 {
+		fields = append(fields, zap.Strings("connection_hops", ci.Upgrade.Fields.ConnectionHops))
+	}
+	ccp.log.Info("Observed channel upgrade message", append(fields, zap.String("event_type", message))...)
+}
+
+func isChannelUpgradeEvent(eventType string) bool {
+	switch eventType {
+	case chantypes.EventTypeChannelUpgradeInit,
+		chantypes.EventTypeChannelUpgradeTry,
+		chantypes.EventTypeChannelUpgradeAck,
+		chantypes.EventTypeChannelUpgradeConfirm,
+		chantypes.EventTypeChannelUpgradeOpen,
+		chantypes.EventTypeChannelUpgradeTimeout,
+		chantypes.EventTypeChannelUpgradeCancel,
+		chantypes.EventTypeChannelUpgradeError:
+		return true
+	default:
+		return false
+	}
+}
+
+func (ccp *CosmosChainProcessor) triggerFlushForUpgrade(channelKey processor.ChannelKey) {
+	chainID := ccp.chainProvider.ChainId()
+	if ccp.pathProcessors.TriggerFlush(chainID, channelKey) {
+		return
+	}
+	// Attempt using counterparty identifiers when available to ensure flushing is triggered regardless of perspective.
+	if counterpartyKey := channelKey.Counterparty(); counterpartyKey.ChannelID != "" || counterpartyKey.PortID != "" {
+		ccp.pathProcessors.TriggerFlush(chainID, counterpartyKey)
+	}
 }
 
 func (ccp *CosmosChainProcessor) logConnectionMessage(message string, ci provider.ConnectionInfo) {

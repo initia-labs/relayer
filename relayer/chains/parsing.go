@@ -66,7 +66,13 @@ func ParseIBCMessageFromEvent(
 		msgInfo = &PacketInfo{Height: height}
 	case chantypes.EventTypeChannelOpenInit, chantypes.EventTypeChannelOpenTry,
 		chantypes.EventTypeChannelOpenAck, chantypes.EventTypeChannelOpenConfirm,
-		chantypes.EventTypeChannelCloseInit, chantypes.EventTypeChannelClosed, chantypes.EventTypeChannelCloseConfirm:
+
+		chantypes.EventTypeChannelCloseInit, chantypes.EventTypeChannelClosed, chantypes.EventTypeChannelCloseConfirm,
+
+		chantypes.EventTypeChannelUpgradeInit, chantypes.EventTypeChannelUpgradeTry,
+		chantypes.EventTypeChannelUpgradeAck, chantypes.EventTypeChannelUpgradeConfirm,
+		chantypes.EventTypeChannelUpgradeOpen, chantypes.EventTypeChannelUpgradeTimeout, chantypes.EventTypeChannelUpgradeCancel,
+		chantypes.EventTypeChannelUpgradeError:
 		msgInfo = &ChannelInfo{Height: height}
 	case conntypes.EventTypeConnectionOpenInit, conntypes.EventTypeConnectionOpenTry,
 		conntypes.EventTypeConnectionOpenAck, conntypes.EventTypeConnectionOpenConfirm:
@@ -341,6 +347,89 @@ func (res *ChannelInfo) parseChannelAttribute(attr sdk.Attribute) {
 		res.ConnID = attr.Value
 	case chantypes.AttributeVersion:
 		res.Version = attr.Value
+		res.Upgrade.Fields.Version = attr.Value
+	case chantypes.AttributeKeyConnectionHops:
+		res.Upgrade.Fields.ConnectionHops = []string{attr.Value}
+		res.ConnectionHop0 = attr.Value
+	case chantypes.AttributeKeyOrdering:
+		if order, ok := parseChannelOrder(attr.Value); ok {
+			res.Order = order
+			res.Upgrade.Fields.Ordering = order
+		}
+	case chantypes.AttributeKeyUpgradeSequence:
+		if seq, err := strconv.ParseUint(attr.Value, 10, 64); err == nil {
+			res.UpgradeSequence = seq
+		}
+	case chantypes.AttributeKeyUpgradeTimeoutHeight:
+		if timeoutHeight, err := parseHeight(attr.Value); err == nil {
+			res.Upgrade.Timeout.Height = timeoutHeight
+		}
+	case chantypes.AttributeKeyUpgradeTimeoutTimestamp:
+		if timeoutTimestamp, err := strconv.ParseUint(attr.Value, 10, 64); err == nil {
+			res.Upgrade.Timeout.Timestamp = timeoutTimestamp
+		}
+	case chantypes.AttributeKeyChannelState:
+		if state, ok := parseChannelState(attr.Value); ok {
+			res.CounterpartyChannelState = state
+		}
+	case chantypes.AttributeKeyErrorReceipt:
+		res.UpgradeError = attr.Value
+	}
+}
+
+func parseChannelOrder(value string) (chantypes.Order, bool) {
+	upper := strings.ToUpper(value)
+	if v, ok := chantypes.Order_value[upper]; ok {
+		return chantypes.Order(v), true
+	}
+	switch upper {
+	case chantypes.UNORDERED.String():
+		return chantypes.UNORDERED, true
+	case chantypes.ORDERED.String():
+		return chantypes.ORDERED, true
+	case chantypes.NONE.String():
+		return chantypes.NONE, true
+	default:
+		return chantypes.NONE, false
+	}
+}
+
+func parseHeight(value string) (clienttypes.Height, error) {
+	parts := strings.Split(value, "-")
+	if len(parts) != 2 {
+		return clienttypes.Height{}, fmt.Errorf("invalid height: %s", value)
+	}
+	revisionNumber, err := strconv.ParseUint(parts[0], 10, 64)
+	if err != nil {
+		return clienttypes.Height{}, err
+	}
+	revisionHeight, err := strconv.ParseUint(parts[1], 10, 64)
+	if err != nil {
+		return clienttypes.Height{}, err
+	}
+	return clienttypes.Height{RevisionNumber: revisionNumber, RevisionHeight: revisionHeight}, nil
+}
+
+func parseChannelState(value string) (chantypes.State, bool) {
+	upper := strings.ToUpper(value)
+	if v, ok := chantypes.State_value[upper]; ok {
+		return chantypes.State(v), true
+	}
+	switch upper {
+	case chantypes.INIT.String():
+		return chantypes.INIT, true
+	case chantypes.TRYOPEN.String():
+		return chantypes.TRYOPEN, true
+	case chantypes.OPEN.String():
+		return chantypes.OPEN, true
+	case chantypes.CLOSED.String():
+		return chantypes.CLOSED, true
+	case chantypes.FLUSHING.String():
+		return chantypes.FLUSHING, true
+	case chantypes.FLUSHCOMPLETE.String():
+		return chantypes.FLUSHCOMPLETE, true
+	default:
+		return chantypes.UNINITIALIZED, false
 	}
 }
 

@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
+
 	sdkerrors "cosmossdk.io/errors"
 	"cosmossdk.io/x/feegrant"
 	upgradetypes "cosmossdk.io/x/upgrade/types"
@@ -849,6 +851,49 @@ func (cc *CosmosProvider) QueryChannel(ctx context.Context, height int64, channe
 	return res, nil
 }
 
+func (cc *CosmosProvider) QueryChannelWithoutProof(ctx context.Context, channelid, portid string) (*chantypes.Channel, error) {
+	res, err := chantypes.NewQueryClient(cc).Channel(ctx, &chantypes.QueryChannelRequest{
+		PortId:    portid,
+		ChannelId: channelid,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return res.Channel, nil
+}
+
+func (cc *CosmosProvider) QueryUpgrade(ctx context.Context, channelid, portid string) (chantypes.Upgrade, error) {
+	res, err := chantypes.NewQueryClient(cc).Upgrade(ctx, &chantypes.QueryUpgradeRequest{
+		PortId:    portid,
+		ChannelId: channelid,
+	})
+	if err != nil {
+		return chantypes.Upgrade{}, err
+	}
+	return res.Upgrade, nil
+}
+
+func (cc *CosmosProvider) QueryChannelTimeout(ctx context.Context) (chantypes.Timeout, error) {
+	res, err := chantypes.NewQueryClient(cc).ChannelParams(ctx, &chantypes.QueryChannelParamsRequest{})
+	if err != nil {
+		return chantypes.Timeout{}, err
+	}
+	return res.Params.UpgradeTimeout, nil
+}
+
+// QueryChannelUpgrade queries the currently stored upgrade for the provided
+// port and channel identifiers, returning the upgrade information along with a
+// merkle proof at the requested height.
+func (cc *CosmosProvider) QueryChannelUpgrade(ctx context.Context, height int64, portID, channelID string) (*chantypes.QueryUpgradeResponse, error) {
+	return cc.queryChannelUpgradeABCI(ctx, height, portID, channelID)
+}
+
+// QueryChannelUpgradeError queries the upgrade error receipt associated with
+// the provided port and channel identifiers.
+func (cc *CosmosProvider) QueryChannelUpgradeError(ctx context.Context, height int64, portID, channelID string) (*chantypes.QueryUpgradeErrorResponse, error) {
+	return cc.queryChannelUpgradeErrorABCI(ctx, height, portID, channelID)
+}
+
 func (cc *CosmosProvider) queryChannelABCI(ctx context.Context, height int64, portID, channelID string) (*chantypes.QueryChannelResponse, error) {
 	key := host.ChannelKey(portID, channelID)
 
@@ -874,6 +919,48 @@ func (cc *CosmosProvider) queryChannelABCI(ctx context.Context, height int64, po
 		Proof:       proofBz,
 		ProofHeight: proofHeight,
 	}, nil
+}
+
+func (cc *CosmosProvider) queryChannelUpgradeABCI(ctx context.Context, height int64, portID, channelID string) (*chantypes.QueryUpgradeResponse, error) {
+	key := host.ChannelUpgradeKey(portID, channelID)
+
+	value, proofBz, proofHeight, err := cc.QueryTendermintProof(ctx, height, key)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(value) == 0 {
+		return nil, sdkerrors.Wrapf(chantypes.ErrUpgradeNotFound, "portID (%s), channelID (%s)", portID, channelID)
+	}
+
+	cdc := codec.NewProtoCodec(cc.Cdc.InterfaceRegistry)
+	var upgrade chantypes.Upgrade
+	if err := cdc.Unmarshal(value, &upgrade); err != nil {
+		return nil, err
+	}
+
+	return chantypes.NewQueryUpgradeResponse(upgrade, proofBz, proofHeight), nil
+}
+
+func (cc *CosmosProvider) queryChannelUpgradeErrorABCI(ctx context.Context, height int64, portID, channelID string) (*chantypes.QueryUpgradeErrorResponse, error) {
+	key := host.ChannelUpgradeErrorKey(portID, channelID)
+
+	value, proofBz, proofHeight, err := cc.QueryTendermintProof(ctx, height, key)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(value) == 0 {
+		return nil, sdkerrors.Wrapf(chantypes.ErrUpgradeErrorNotFound, "portID (%s), channelID (%s)", portID, channelID)
+	}
+
+	cdc := codec.NewProtoCodec(cc.Cdc.InterfaceRegistry)
+	var receipt chantypes.ErrorReceipt
+	if err := cdc.Unmarshal(value, &receipt); err != nil {
+		return nil, err
+	}
+
+	return chantypes.NewQueryUpgradeErrorResponse(receipt, proofBz, proofHeight), nil
 }
 
 // QueryChannelClient returns the client state of the client supporting a given channel
@@ -1238,6 +1325,21 @@ func (cc *CosmosProvider) QueryStatus(ctx context.Context) (*cclient.Status, err
 		return nil, fmt.Errorf("failed to query node status: %w", err)
 	}
 	return status, nil
+}
+
+func (cc *CosmosProvider) QueryGovAddress(ctx context.Context) (string, error) {
+	res, err := authtypes.NewQueryClient(cc).ModuleAccountByName(ctx, &authtypes.QueryModuleAccountByNameRequest{
+		Name: "gov",
+	})
+	if err != nil {
+		return "", err
+	}
+	var moduleAccount sdk.AccountI
+	err = cc.Cdc.InterfaceRegistry.UnpackAny(res.GetAccount(), &moduleAccount)
+	if err != nil {
+		return "", err
+	}
+	return cc.Cdc.InterfaceRegistry.SigningContext().AddressCodec().BytesToString(moduleAccount.GetAddress())
 }
 
 // QueryDenomTrace takes a denom from IBC and queries the information about it

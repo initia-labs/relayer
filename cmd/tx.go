@@ -53,6 +53,8 @@ Most of these commands take a [path] argument. Make sure:
 		createConnectionCmd(a),
 		createChannelCmd(a),
 		closeChannelCmd(a),
+		upgradeChannelCmd(a),
+		cancelChannelUpgradeCmd(a),
 		lineBreakCommand(),
 		registerCounterpartyCmd(a),
 	)
@@ -655,6 +657,140 @@ $ %s tx channel-close demo-path channel-0 transfer -o 3s`,
 
 	cmd = timeoutFlag(a.viper, cmd)
 	cmd = retryFlag(a.viper, cmd)
+	cmd = memoFlag(a.viper, cmd)
+	return cmd
+}
+
+func upgradeChannelCmd(a *appState) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "upgrade-channel path_name src_channel_id src_port_id",
+		Aliases: []string{"up-chan"},
+		Short:   "upgrade a channel with a configured path and options",
+		Long: strings.TrimSpace(`Upgrade a channel between two IBC-connected networks
+along a specific path.`,
+		),
+		Args: withUsage(cobra.ExactArgs(3)),
+		Example: strings.TrimSpace(fmt.Sprintf(`
+$ %s transact upgrade-channel demo-path channel-0 transfer --order unordered --version ics20-1 --connection-hops connection-0`,
+			appName,
+		)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			pathName := args[0]
+
+			srcChannelID := args[1]
+			srcPortID := args[2]
+
+			c, src, dst, err := a.config.ChainsFromPath(pathName)
+			if err != nil {
+				return err
+			}
+
+			to, err := getTimeout(cmd)
+			if err != nil {
+				return err
+			}
+
+			retries, err := cmd.Flags().GetUint64(flagMaxRetries)
+			if err != nil {
+				return err
+			}
+
+			order, err := cmd.Flags().GetString(flagOrder)
+			if err != nil {
+				return err
+			}
+
+			version, err := cmd.Flags().GetString(flagVersion)
+			if err != nil {
+				return err
+			}
+
+			connectionHops, err := cmd.Flags().GetStringArray(flagConnectionHops)
+			if err != nil {
+				return err
+			} else if len(connectionHops) == 0 {
+				return errors.New("empty connection hops")
+			}
+
+			deposit, err := cmd.Flags().GetString(flagDeposit)
+			if err != nil {
+				return err
+			}
+
+			// ensure that keys exist
+			if exists := c[src].ChainProvider.KeyExists(c[src].ChainProvider.Key()); !exists {
+				return fmt.Errorf("key %s not found on src chain %s", c[src].ChainProvider.Key(), c[src].ChainID())
+			}
+
+			if exists := c[dst].ChainProvider.KeyExists(c[dst].ChainProvider.Key()); !exists {
+				return fmt.Errorf("key %s not found on dst chain %s", c[dst].ChainProvider.Key(), c[dst].ChainID())
+			}
+
+			// create channel if it isn't already created
+			return c[src].UpgradeChannel(
+				cmd.Context(),
+				c[dst],
+				to,
+				retries,
+				srcChannelID,
+				srcPortID,
+				order,
+				version,
+				connectionHops,
+				deposit,
+				a.config.memo(cmd),
+				pathName,
+			)
+		},
+	}
+
+	cmd = timeoutFlag(a.viper, cmd)
+	cmd = retryFlag(a.viper, cmd)
+	cmd = channelParameterFlags(a.viper, cmd)
+	cmd = connectionHopsFlag(a.viper, cmd)
+	cmd.Flags().String(flagDeposit, "", "initial deposit for the channel upgrade governance proposal (e.g. 1000000uatom)")
+	cmd = memoFlag(a.viper, cmd)
+	return cmd
+}
+
+func cancelChannelUpgradeCmd(a *appState) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "cancel-channel-upgrade path_name src_channel_id src_port_id",
+		Short: "submit a governance proposal to cancel a channel upgrade",
+		Long: strings.TrimSpace(`Submit a governance proposal that calls MsgChannelUpgradeCancel on the
+source chain for the specified channel and port.`),
+		Args: withUsage(cobra.ExactArgs(3)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			pathName := args[0]
+			srcChannelID := args[1]
+			srcPortID := args[2]
+
+			c, src, _, err := a.config.ChainsFromPath(pathName)
+			if err != nil {
+				return err
+			}
+
+			deposit, err := cmd.Flags().GetString(flagDeposit)
+			if err != nil {
+				return err
+			}
+
+			if exists := c[src].ChainProvider.KeyExists(c[src].ChainProvider.Key()); !exists {
+				return fmt.Errorf("key %s not found on src chain %s", c[src].ChainProvider.Key(), c[src].ChainID())
+			}
+
+			return c[src].CancelChannelUpgrade(
+				cmd.Context(),
+				srcChannelID,
+				srcPortID,
+				deposit,
+				a.config.memo(cmd),
+				pathName,
+			)
+		},
+	}
+
+	cmd.Flags().String(flagDeposit, "", "initial deposit for the channel upgrade cancel governance proposal (e.g. 1000000uatom)")
 	cmd = memoFlag(a.viper, cmd)
 	return cmd
 }
