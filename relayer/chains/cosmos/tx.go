@@ -1929,20 +1929,30 @@ func (cc *CosmosProvider) QueryABCIWithAttestations(ctx context.Context, req abc
 
 	wg := sync.WaitGroup{}
 	results := make([]*coretypes.ResultABCIQueryWithAttestation, len(cc.AttestationClients))
-	getAttestationFunc := func(client cclient.AttestationClient, res **coretypes.ResultABCIQueryWithAttestation) {
+	getAttestationFunc := func(client cclient.AttestationClient, res **coretypes.ResultABCIQueryWithAttestation, index int, rpcAddress string) {
 		defer wg.Done()
 
+		var errString string
 		result, err := client.ABCIQueryWithAttestation(ctx, req.Path, req.Data, opts)
-		if err != nil || !result.Response.IsOK() {
+		if err != nil {
+			errString = err.Error()
+		} else if !result.Response.IsOK() {
+			errString = fmt.Sprintf("code: %d, log: %s", result.Response.Code, result.Response.Log)
+		} else {
+			*res = result
 			return
 		}
-
-		*res = result
+		cc.log.Info("failed to get attestation",
+			zap.String("error", errString),
+			zap.Int("attestor", index),
+			zap.String("rpc address", rpcAddress),
+			zap.String("proof key", string(req.Data)),
+		)
 	}
 
 	for i := range cc.AttestationClients {
 		wg.Add(1)
-		go getAttestationFunc(cc.AttestationClients[i], &results[i])
+		go getAttestationFunc(cc.AttestationClients[i], &results[i], i, cc.PCfg.AttestorConfiguration.AttestorRpcAddrs[i])
 	}
 
 	wg.Wait()
@@ -1950,7 +1960,6 @@ func (cc *CosmosProvider) QueryABCIWithAttestations(ctx context.Context, req abc
 	consensusResults := make(map[string][]*coretypes.ResultABCIQueryWithAttestation)
 	for i, result := range results {
 		if result == nil {
-			cc.log.Info("failed to get attestation", zap.Int("attestor", i), zap.String("rpc address", cc.PCfg.AttestorConfiguration.AttestorRpcAddrs[i]))
 			continue
 		}
 		opsBz, err := result.Response.ProofOps.Marshal()

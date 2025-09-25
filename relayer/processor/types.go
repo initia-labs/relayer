@@ -169,6 +169,7 @@ type ChannelKey struct {
 	PortID                string
 	CounterpartyChannelID string
 	CounterpartyPortID    string
+	UpgradeSequence       uint64
 }
 
 // ChannelState is used for caching channel open state and a lookup for the channel order.
@@ -184,6 +185,7 @@ func (k ChannelKey) Counterparty() ChannelKey {
 		PortID:                k.CounterpartyPortID,
 		CounterpartyChannelID: k.ChannelID,
 		CounterpartyPortID:    k.PortID,
+		UpgradeSequence:       k.UpgradeSequence,
 	}
 }
 
@@ -677,6 +679,7 @@ func ChannelInfoChannelKey(info provider.ChannelInfo) ChannelKey {
 		CounterpartyChannelID: info.CounterpartyChannelID,
 		PortID:                info.PortID,
 		CounterpartyPortID:    info.CounterpartyPortID,
+		UpgradeSequence:       info.UpgradeSequence,
 	}
 }
 
