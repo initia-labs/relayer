@@ -559,6 +559,17 @@ func (cc *PenumbraProvider) QueryChannel(ctx context.Context, height int64, chan
 	return res, nil
 }
 
+func (cc *PenumbraProvider) QueryChannelWithoutProof(ctx context.Context, channelid, portid string) (*chantypes.Channel, error) {
+	res, err := chantypes.NewQueryClient(cc).Channel(ctx, &chantypes.QueryChannelRequest{
+		PortId:    portid,
+		ChannelId: channelid,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return res.Channel, nil
+}
+
 func (cc *PenumbraProvider) queryChannelABCI(ctx context.Context, height int64, portID, channelID string) (*chantypes.QueryChannelResponse, error) {
 	key := host.ChannelKey(portID, channelID)
 
@@ -1014,4 +1025,8 @@ func (cc *PenumbraProvider) QueryStatus(ctx context.Context) (*coretypes.ResultS
 func (cc *PenumbraProvider) QueryICQWithProof(ctx context.Context, msgType string, request []byte, height uint64) (provider.ICQProof, error) {
 	//TODO implement me
 	panic("implement me")
+}
+
+func (cc *PenumbraProvider) QueryUpgrade(ctx context.Context, channelid, portid string) (chantypes.Upgrade, error) {
+	return chantypes.Upgrade{}, errChannelUpgradeUnsupported
 }

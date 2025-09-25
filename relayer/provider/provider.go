@@ -125,12 +125,14 @@ type ConnectionInfo struct {
 // ChannelInfo contains relevant properties from channel handshake messages
 // which may be necessary to construct the next message for the counterparty chain.
 type ChannelInfo struct {
-	Height                uint64
-	PortID                string
-	ChannelID             string
-	CounterpartyPortID    string
-	CounterpartyChannelID string
-	ConnID                string
+	Height                     uint64
+	PortID                     string
+	ChannelID                  string
+	CounterpartyPortID         string
+	CounterpartyChannelID      string
+	ConnID                     string
+	ConnectionHop0             string
+	CounterpartyConnectionHop0 string
 
 	// CounterpartyConnID doesn't come from any events, but is needed for
 	// MsgChannelOpenTry, so should be added manually for MsgChannelOpenInit.
@@ -138,6 +140,40 @@ type ChannelInfo struct {
 
 	Order   chantypes.Order
 	Version string
+
+	// Upgrade is the upgrade information for the channel upgrade.
+	Upgrade chantypes.Upgrade
+
+	// UpgradeSequence is populated from channel upgrade events to track the
+	// sequence number associated with the in-flight upgrade handshake.
+	UpgradeSequence uint64
+
+	ChannelState chantypes.State
+
+	// CounterpartyChannelState captures the state reported by the
+	// counterparty chain during the upgrade handshake (e.g. the state observed
+	// on an upgrade confirm event).
+	CounterpartyChannelState chantypes.State
+
+	// UpgradeError stores any error receipt message surfaced during the
+	// upgrade handshake. It is used when constructing timeout or cancel
+	// messages.
+	UpgradeError string
+}
+
+func (ci ChannelInfo) Counterparty() ChannelInfo {
+	return ChannelInfo{
+		PortID:                     ci.CounterpartyPortID,
+		ChannelID:                  ci.CounterpartyChannelID,
+		ConnID:                     ci.CounterpartyConnID,
+		ConnectionHop0:             ci.CounterpartyConnectionHop0,
+		CounterpartyPortID:         ci.PortID,
+		CounterpartyChannelID:      ci.ChannelID,
+		CounterpartyConnID:         ci.ConnID,
+		CounterpartyConnectionHop0: ci.ConnectionHop0,
+		Order:                      ci.Order,
+		Version:                    ci.Version,
+	}
 }
 
 // ClientICQQueryID string wrapper for query ID.
@@ -175,6 +211,33 @@ type ChannelProof struct {
 	ProofHeight clienttypes.Height
 	Ordering    chantypes.Order
 	Version     string
+}
+
+// ChannelUpgradeProof contains the proof information necessary to assemble
+// channel upgrade handshake and auxiliary messages.
+type ChannelUpgradeProof struct {
+	ChannelProof ChannelProof
+	Upgrade      chantypes.Upgrade
+	UpgradeProof []byte
+	// UpgradeProofHeight is the height at which the upgrade proof was created.
+	UpgradeProofHeight clienttypes.Height
+
+	// CounterpartyChannel is populated when the counterparty channel state is
+	// required for message construction (e.g. timeout handling).
+	CounterpartyChannel *chantypes.Channel
+
+	// ErrorReceipt contains the upgrade error receipt when the handshake has
+	// aborted along with its corresponding proof bytes.
+	ErrorReceipt *chantypes.ErrorReceipt
+	ErrorProof   []byte
+	// ErrorProofHeight is the height associated with the error receipt proof.
+	ErrorProofHeight clienttypes.Height
+}
+
+type ChannelUpgradeErrorProof struct {
+	Receipt     *chantypes.ErrorReceipt
+	Proof       []byte
+	ProofHeight clienttypes.Height
 }
 
 type ICQProof struct {
@@ -356,6 +419,19 @@ type ChainProvider interface {
 	// on the counterparty chain, and assembles a MsgChannelCloseConfirm message ready to write to the chain.
 	MsgChannelCloseConfirm(msgCloseInit ChannelInfo, proof ChannelProof) (RelayerMessage, error)
 
+	// ChannelUpgradeProof queries the channel upgrade and associated proofs
+	// required to construct channel upgrade handshake messages.
+	ChannelUpgradeProof(ctx context.Context, msg ChannelInfo, height uint64) (ChannelUpgradeProof, error)
+	ChannelUpgradeErrorProof(ctx context.Context, msg ChannelInfo, height uint64) (ChannelUpgradeErrorProof, error)
+
+	MsgChannelUpgradeTry(msg ChannelInfo, proof ChannelUpgradeProof) (RelayerMessage, error)
+	MsgChannelUpgradeAck(msg ChannelInfo, proof ChannelUpgradeProof) (RelayerMessage, error)
+	MsgChannelUpgradeConfirm(msg ChannelInfo, proof ChannelUpgradeProof) (RelayerMessage, error)
+	MsgChannelUpgradeOpen(msg ChannelInfo, proof ChannelProof) (RelayerMessage, error)
+	MsgChannelUpgradeTimeout(msg ChannelInfo, proof ChannelUpgradeProof) (RelayerMessage, error)
+	MsgChannelUpgradeCancel(msg ChannelInfo, proof ChannelUpgradeErrorProof, govAddress string) (RelayerMessage, error)
+	MsgChannelUpgradeInit(msg ChannelInfo, govAddress string) (RelayerMessage, error)
+
 	// [End] Channel handshake IBC message assembly
 
 	// [Begin] Client IBC message assembly
@@ -455,6 +531,7 @@ type QueryProvider interface {
 		connectionProofHeight ibcexported.Height, err error)
 
 	// ics 04 - channel
+	QueryChannelWithoutProof(ctx context.Context, channelid, portid string) (*chantypes.Channel, error)
 	QueryChannel(ctx context.Context, height int64, channelid, portid string) (chanRes *chantypes.QueryChannelResponse, err error)
 	QueryChannelClient(ctx context.Context, height int64, channelid, portid string) (*clienttypes.IdentifiedClientState, error)
 	QueryConnectionChannels(ctx context.Context, height int64, connectionid string) ([]*chantypes.IdentifiedChannel, error)
@@ -468,6 +545,8 @@ type QueryProvider interface {
 	QueryPacketCommitment(ctx context.Context, height int64, channelid, portid string, seq uint64) (comRes *chantypes.QueryPacketCommitmentResponse, err error)
 	QueryPacketAcknowledgement(ctx context.Context, height int64, channelid, portid string, seq uint64) (ackRes *chantypes.QueryPacketAcknowledgementResponse, err error)
 	QueryPacketReceipt(ctx context.Context, height int64, channelid, portid string, seq uint64) (recRes *chantypes.QueryPacketReceiptResponse, err error)
+
+	QueryUpgrade(ctx context.Context, channelid, portid string) (chantypes.Upgrade, error)
 
 	// ics 20 - transfer
 	QueryDenomTrace(ctx context.Context, denom string) (*transfertypes.DenomTrace, error)

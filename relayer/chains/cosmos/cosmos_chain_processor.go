@@ -48,6 +48,9 @@ type CosmosChainProcessor struct {
 	// map of connection ID to client ID
 	connectionClients map[string]string
 
+	// map of connection ID to counterparty connection ID
+	counterpartyConnectionId map[string]string
+
 	// map of channel ID to connection ID
 	channelConnections map[string]string
 
@@ -64,14 +67,15 @@ func NewCosmosChainProcessor(
 	metrics *processor.PrometheusMetrics,
 ) *CosmosChainProcessor {
 	return &CosmosChainProcessor{
-		log:                  log.With(zap.String("chain_name", provider.ChainName()), zap.String("chain_id", provider.ChainId())),
-		chainProvider:        provider,
-		latestClientState:    make(latestClientState),
-		connectionStateCache: make(processor.ConnectionStateCache),
-		channelStateCache:    make(processor.ChannelStateCache),
-		connectionClients:    make(map[string]string),
-		channelConnections:   make(map[string]string),
-		metrics:              metrics,
+		log:                      log.With(zap.String("chain_name", provider.ChainName()), zap.String("chain_id", provider.ChainId())),
+		chainProvider:            provider,
+		latestClientState:        make(latestClientState),
+		connectionStateCache:     make(processor.ConnectionStateCache),
+		channelStateCache:        make(processor.ChannelStateCache),
+		counterpartyConnectionId: make(map[string]string),
+		connectionClients:        make(map[string]string),
+		channelConnections:       make(map[string]string),
+		metrics:                  metrics,
 	}
 }
 
@@ -337,6 +341,7 @@ func (ccp *CosmosChainProcessor) initializeConnectionState(ctx context.Context) 
 		return fmt.Errorf("error querying connections: %w", err)
 	}
 	for _, c := range connections {
+		ccp.counterpartyConnectionId[c.Id] = c.Counterparty.ConnectionId
 		ccp.connectionClients[c.Id] = c.ClientId
 		ccp.connectionStateCache[processor.ConnectionKey{
 			ConnectionID:         c.Id,
@@ -378,7 +383,6 @@ func (ccp *CosmosChainProcessor) initializeChannelState(ctx context.Context) err
 
 		ccp.channelStateCache.SetOpen(k, ch.State == chantypes.OPEN, ch.Ordering)
 	}
-
 	return nil
 }
 

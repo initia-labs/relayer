@@ -71,6 +71,7 @@ type PathProcessor struct {
 
 	// Signals to retry.
 	retryProcess chan struct{}
+	flushRequest chan struct{}
 
 	sentInitialMsg bool
 
@@ -95,6 +96,17 @@ func (p PathProcessors) IsRelayedChannel(k ChannelKey, chainID string) bool {
 	return false
 }
 
+func (p PathProcessors) TriggerFlush(chainID string, channelKey ChannelKey) bool {
+	triggered := false
+	for _, pp := range p {
+		if pp.IsRelayedChannel(chainID, channelKey) {
+			pp.TriggerFlush()
+			triggered = true
+		}
+	}
+	return triggered
+}
+
 func NewPathProcessor(
 	log *zap.Logger,
 	pathEnd1 PathEnd,
@@ -113,6 +125,7 @@ func NewPathProcessor(
 		pathEnd1:                  newPathEndRuntime(log, pathEnd1, metrics),
 		pathEnd2:                  newPathEndRuntime(log, pathEnd2, metrics),
 		retryProcess:              make(chan struct{}, 2),
+		flushRequest:              make(chan struct{}, 1),
 		memo:                      memo,
 		clientUpdateThresholdTime: clientUpdateThresholdTime,
 		flushInterval:             flushInterval,
@@ -282,6 +295,18 @@ func (pp *PathProcessor) ProcessBacklogIfReady() {
 	}
 }
 
+// TriggerFlush requests that the path processor perform a flush cycle as soon as possible.
+func (pp *PathProcessor) TriggerFlush() {
+	if pp.flushRequest == nil {
+		return
+	}
+	select {
+	case pp.flushRequest <- struct{}{}:
+	default:
+		pp.log.Debug("Flush request already scheduled")
+	}
+}
+
 // ChainProcessors call this method when they have new IBC messages
 func (pp *PathProcessor) HandleNewData(chainID string, cacheData ChainProcessorCacheData) {
 	if pp.isLocalhost {
@@ -309,6 +334,37 @@ func (pp *PathProcessor) handleFlush(ctx context.Context) {
 	}
 	pp.flushTimer.Stop()
 	pp.flushTimer = time.NewTimer(flushTimer)
+}
+
+func (pp *PathProcessor) drainIncomingCache(ctx context.Context, cancel func()) {
+	for len(pp.pathEnd1.incomingCacheData) > 0 {
+		d := <-pp.pathEnd1.incomingCacheData
+		pp.pathEnd1.mergeCacheData(
+			ctx,
+			cancel,
+			d,
+			pp.pathEnd2.info.ChainID,
+			pp.pathEnd2.inSync,
+			pp.messageLifecycle,
+			pp.pathEnd2,
+			pp.memoLimit,
+			pp.maxReceiverSize,
+		)
+	}
+	for len(pp.pathEnd2.incomingCacheData) > 0 {
+		d := <-pp.pathEnd2.incomingCacheData
+		pp.pathEnd2.mergeCacheData(
+			ctx,
+			cancel,
+			d,
+			pp.pathEnd1.info.ChainID,
+			pp.pathEnd1.inSync,
+			pp.messageLifecycle,
+			pp.pathEnd1,
+			pp.memoLimit,
+			pp.maxReceiverSize,
+		)
+	}
 }
 
 // processAvailableSignals will block if signals are not yet available, otherwise it will process one of the available signals.
@@ -359,37 +415,10 @@ func (pp *PathProcessor) processAvailableSignals(ctx context.Context, cancel fun
 	case <-pp.retryProcess:
 		// No new data to merge in, just retry handling.
 	case <-pp.flushTimer.C:
-		for len(pp.pathEnd1.incomingCacheData) > 0 {
-			d := <-pp.pathEnd1.incomingCacheData
-			// we have new data from ChainProcessor for pathEnd1
-			pp.pathEnd1.mergeCacheData(
-				ctx,
-				cancel,
-				d,
-				pp.pathEnd2.info.ChainID,
-				pp.pathEnd2.inSync,
-				pp.messageLifecycle,
-				pp.pathEnd2,
-				pp.memoLimit,
-				pp.maxReceiverSize,
-			)
-		}
-		for len(pp.pathEnd2.incomingCacheData) > 0 {
-			d := <-pp.pathEnd2.incomingCacheData
-			// we have new data from ChainProcessor for pathEnd2
-			pp.pathEnd2.mergeCacheData(
-				ctx,
-				cancel,
-				d,
-				pp.pathEnd1.info.ChainID,
-				pp.pathEnd1.inSync,
-				pp.messageLifecycle,
-				pp.pathEnd1,
-				pp.memoLimit,
-				pp.maxReceiverSize,
-			)
-		}
-		// Periodic flush to clear out any old packets
+		pp.drainIncomingCache(ctx, cancel)
+		pp.handleFlush(ctx)
+	case <-pp.flushRequest:
+		pp.drainIncomingCache(ctx, cancel)
 		pp.handleFlush(ctx)
 	}
 	return false

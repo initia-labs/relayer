@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
+	"time"
 
 	conntypes "github.com/cosmos/ibc-go/v8/modules/core/03-connection/types"
 	chantypes "github.com/cosmos/ibc-go/v8/modules/core/04-channel/types"
@@ -507,6 +509,7 @@ func (pp *PathProcessor) unrelayedChannelHandshakeMessages(
 		if pathEndChannelHandshakeMessages.Dst.shouldSendChannelMessage(
 			msgOpenConfirm,
 			pathEndChannelHandshakeMessages.Src,
+			true,
 		) {
 			res.DstMessages = append(res.DstMessages, msgOpenConfirm)
 		}
@@ -531,7 +534,7 @@ func (pp *PathProcessor) unrelayedChannelHandshakeMessages(
 			info:      info,
 		}
 		if pathEndChannelHandshakeMessages.Src.shouldSendChannelMessage(
-			msgOpenAck, pathEndChannelHandshakeMessages.Dst,
+			msgOpenAck, pathEndChannelHandshakeMessages.Dst, true,
 		) {
 			res.SrcMessages = append(res.SrcMessages, msgOpenAck)
 		}
@@ -555,7 +558,7 @@ func (pp *PathProcessor) unrelayedChannelHandshakeMessages(
 		}
 
 		if pathEndChannelHandshakeMessages.Dst.shouldSendChannelMessage(
-			msgOpenTry, pathEndChannelHandshakeMessages.Src,
+			msgOpenTry, pathEndChannelHandshakeMessages.Src, true,
 		) {
 			res.DstMessages = append(res.DstMessages, msgOpenTry)
 		}
@@ -573,13 +576,459 @@ func (pp *PathProcessor) unrelayedChannelHandshakeMessages(
 			info:      info,
 		}
 		if pathEndChannelHandshakeMessages.Src.shouldSendChannelMessage(
-			msgOpenInit, pathEndChannelHandshakeMessages.Dst,
+			msgOpenInit, pathEndChannelHandshakeMessages.Dst, true,
 		) {
 			res.SrcMessages = append(res.SrcMessages, msgOpenInit)
 		}
 	}
 
 	return res
+}
+
+func (pp *PathProcessor) unrelayedChannelUpgradeMessages(
+	ctx context.Context,
+	pathEndChannelUpgradeMessages pathEndChannelUpgradeMessages,
+) (pathEndChannelUpgradeResponse, error) {
+	var (
+		res         pathEndChannelUpgradeResponse
+		toDeleteSrc = make(map[string][]ChannelKey)
+		toDeleteDst = make(map[string][]ChannelKey)
+	)
+	processRemovals := func() {
+		pathEndChannelUpgradeMessages.Src.messageCache.ChannelUpgrade.DeleteMessages(toDeleteSrc)
+		pathEndChannelUpgradeMessages.Dst.messageCache.ChannelUpgrade.DeleteMessages(toDeleteDst)
+		pathEndChannelUpgradeMessages.Src.channelProcessing.deleteMessages(toDeleteSrc)
+		pathEndChannelUpgradeMessages.Dst.channelProcessing.deleteMessages(toDeleteDst)
+		toDeleteSrc = make(map[string][]ChannelKey)
+		toDeleteDst = make(map[string][]ChannelKey)
+	}
+
+	for chanKey, info := range pathEndChannelUpgradeMessages.SrcMsgChannelUpgradeError {
+		dstChannel, err := pathEndChannelUpgradeMessages.Dst.chainProvider.QueryChannelWithoutProof(ctx, info.ChannelID, info.PortID)
+		if err != nil {
+			return pathEndChannelUpgradeResponse{}, err
+		}
+
+		if (dstChannel.State == chantypes.FLUSHCOMPLETE && info.UpgradeSequence != dstChannel.UpgradeSequence) || info.UpgradeSequence < dstChannel.UpgradeSequence {
+			pp.log.Info(
+				"Channel is flush complete and upgrade sequence does not match, skipping upgrade error",
+				zap.String("chain_id", pathEndChannelUpgradeMessages.Dst.info.ChainID),
+				zap.String("channel_id", info.ChannelID),
+				zap.String("port_id", info.PortID),
+				zap.Uint64("upgrade_sequence", info.UpgradeSequence),
+				zap.Uint64("dst_upgrade_sequence", dstChannel.UpgradeSequence),
+				zap.String("state", dstChannel.State.String()),
+			)
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeError] = append(
+				toDeleteSrc[chantypes.EventTypeChannelUpgradeError], chanKey,
+			)
+		} else if _, err := pathEndChannelUpgradeMessages.Dst.chainProvider.QueryUpgrade(ctx, info.ChannelID, info.PortID); err == nil {
+			msgCancel := channelIBCMessage{
+				eventType: chantypes.EventTypeChannelUpgradeCancel,
+				info:      info,
+			}
+
+			if pathEndChannelUpgradeMessages.Dst.shouldSendChannelMessage(
+				msgCancel, pathEndChannelUpgradeMessages.Src, true, // skipping height check because we are sending to the source
+			) {
+				res.DstMessages = append(res.DstMessages, msgCancel)
+			}
+		} else if strings.Contains(err.Error(), "upgrade not found") {
+			pp.log.Info(
+				"destination upgrade not found, skipping upgrade error",
+				zap.String("chain_id", pathEndChannelUpgradeMessages.Dst.info.ChainID),
+				zap.String("channel_id", info.ChannelID),
+				zap.String("port_id", info.PortID),
+			)
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeError] = append(
+				toDeleteSrc[chantypes.EventTypeChannelUpgradeError], chanKey,
+			)
+		} else {
+			return pathEndChannelUpgradeResponse{}, err
+		}
+
+		counterpartyKey := chanKey.Counterparty()
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeTimeout] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeTimeout], chanKey,
+		)
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeOpen] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeOpen], chanKey,
+		)
+		toDeleteDst[chantypes.EventTypeChannelUpgradeConfirm] = append(
+			toDeleteDst[chantypes.EventTypeChannelUpgradeConfirm], counterpartyKey,
+		)
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeAck] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeAck], chanKey,
+		)
+		toDeleteDst[chantypes.EventTypeChannelUpgradeTry] = append(
+			toDeleteDst[chantypes.EventTypeChannelUpgradeTry], counterpartyKey,
+		)
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeInit] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeInit], chanKey,
+		)
+		delete(pathEndChannelUpgradeMessages.Src.upgradeTimeout, chanKey)
+		delete(pathEndChannelUpgradeMessages.Dst.upgradeTimeout, chanKey.Counterparty())
+	}
+
+	for chanKey := range pathEndChannelUpgradeMessages.SrcMsgChannelUpgradeCancel {
+		counterpartyKey := chanKey.Counterparty()
+		toDeleteDst[chantypes.EventTypeChannelUpgradeError] = append(
+			toDeleteDst[chantypes.EventTypeChannelUpgradeError], counterpartyKey,
+		)
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeTimeout] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeTimeout], chanKey,
+		)
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeCancel] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeCancel], chanKey,
+		)
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeOpen] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeOpen], chanKey,
+		)
+		toDeleteDst[chantypes.EventTypeChannelUpgradeConfirm] = append(
+			toDeleteDst[chantypes.EventTypeChannelUpgradeConfirm], counterpartyKey,
+		)
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeAck] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeAck], chanKey,
+		)
+		toDeleteDst[chantypes.EventTypeChannelUpgradeTry] = append(
+			toDeleteDst[chantypes.EventTypeChannelUpgradeTry], counterpartyKey,
+		)
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeInit] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeInit], chanKey,
+		)
+		delete(pathEndChannelUpgradeMessages.Src.upgradeTimeout, chanKey)
+		delete(pathEndChannelUpgradeMessages.Dst.upgradeTimeout, chanKey.Counterparty())
+	}
+
+	processRemovals()
+
+	for chanKey := range pathEndChannelUpgradeMessages.SrcMsgChannelUpgradeTimeout {
+		counterpartyKey := chanKey.Counterparty()
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeTimeout] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeTimeout], chanKey,
+		)
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeCancel] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeCancel], chanKey,
+		)
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeOpen] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeOpen], chanKey,
+		)
+		toDeleteDst[chantypes.EventTypeChannelUpgradeConfirm] = append(
+			toDeleteDst[chantypes.EventTypeChannelUpgradeConfirm], counterpartyKey,
+		)
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeAck] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeAck], chanKey,
+		)
+		toDeleteDst[chantypes.EventTypeChannelUpgradeTry] = append(
+			toDeleteDst[chantypes.EventTypeChannelUpgradeTry], counterpartyKey,
+		)
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeInit] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeInit], chanKey,
+		)
+		delete(pathEndChannelUpgradeMessages.Src.upgradeTimeout, chanKey)
+		delete(pathEndChannelUpgradeMessages.Dst.upgradeTimeout, chanKey.Counterparty())
+	}
+
+	processRemovals()
+
+	for chanKey, timeout := range pathEndChannelUpgradeMessages.Src.upgradeTimeout {
+		if timeout.IsZero() || !pathEndChannelUpgradeMessages.Dst.latestBlock.Time.After(timeout) {
+			continue
+		}
+
+		srcChannel, err := pathEndChannelUpgradeMessages.Src.chainProvider.QueryChannelWithoutProof(ctx, chanKey.ChannelID, chanKey.PortID)
+		if err != nil {
+			return pathEndChannelUpgradeResponse{}, err
+		}
+
+		if srcChannel.State != chantypes.FLUSHING && srcChannel.State != chantypes.FLUSHCOMPLETE {
+			pp.log.Info(
+				"Channel is not flushing or flush complete, skipping upgrade timeout",
+				zap.String("chain_id", pathEndChannelUpgradeMessages.Src.info.ChainID),
+				zap.String("channel_id", chanKey.ChannelID),
+				zap.String("port_id", chanKey.PortID),
+				zap.String("state", srcChannel.State.String()),
+			)
+			pathEndChannelUpgradeMessages.Src.upgradeTimeout[chanKey] = time.Time{}
+			continue
+		}
+
+		dstChannel, err := pathEndChannelUpgradeMessages.Dst.chainProvider.QueryChannelWithoutProof(ctx, chanKey.CounterpartyChannelID, chanKey.CounterpartyPortID)
+		if err != nil {
+			return pathEndChannelUpgradeResponse{}, err
+		}
+
+		if dstChannel.State != chantypes.FLUSHING && dstChannel.State != chantypes.OPEN {
+			pp.log.Info(
+				"Counterparty channel is not flushing or open, skipping upgrade timeout",
+				zap.String("chain_id", pathEndChannelUpgradeMessages.Dst.info.ChainID),
+				zap.String("channel_id", chanKey.CounterpartyChannelID),
+				zap.String("port_id", chanKey.CounterpartyPortID),
+				zap.String("state", dstChannel.State.String()),
+			)
+			pathEndChannelUpgradeMessages.Src.upgradeTimeout[chanKey] = time.Time{}
+			continue
+		}
+
+		msgTimeout := channelIBCMessage{
+			eventType: chantypes.EventTypeChannelUpgradeTimeout,
+			info: provider.ChannelInfo{
+				ChannelID:             chanKey.ChannelID,
+				PortID:                chanKey.PortID,
+				CounterpartyChannelID: chanKey.CounterpartyChannelID,
+				CounterpartyPortID:    chanKey.CounterpartyPortID,
+				Height:                pathEndChannelUpgradeMessages.Dst.latestBlock.Height,
+			},
+		}
+
+		if pathEndChannelUpgradeMessages.Src.shouldSendChannelMessage(
+			msgTimeout, pathEndChannelUpgradeMessages.Dst, false, // skipping height check because we are sending to the source
+		) {
+			res.SrcMessages = append(res.SrcMessages, msgTimeout)
+			pathEndChannelUpgradeMessages.Src.upgradeTimeout[chanKey] = time.Time{}
+		}
+
+		counterpartyKey := chanKey.Counterparty()
+
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeOpen] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeOpen], chanKey,
+		)
+		toDeleteDst[chantypes.EventTypeChannelUpgradeConfirm] = append(
+			toDeleteDst[chantypes.EventTypeChannelUpgradeConfirm], counterpartyKey,
+		)
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeAck] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeAck], chanKey,
+		)
+		toDeleteDst[chantypes.EventTypeChannelUpgradeTry] = append(
+			toDeleteDst[chantypes.EventTypeChannelUpgradeTry], counterpartyKey,
+		)
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeInit] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeInit], chanKey,
+		)
+	}
+
+	processRemovals()
+
+	for chanKey, timeout := range pathEndChannelUpgradeMessages.Dst.upgradeTimeout {
+		if timeout.IsZero() || !pathEndChannelUpgradeMessages.Src.latestBlock.Time.After(timeout) {
+			continue
+		}
+
+		dstChannel, err := pathEndChannelUpgradeMessages.Dst.chainProvider.QueryChannelWithoutProof(ctx, chanKey.ChannelID, chanKey.PortID)
+		if err != nil {
+			return pathEndChannelUpgradeResponse{}, err
+		}
+
+		if dstChannel.State != chantypes.FLUSHING && dstChannel.State != chantypes.FLUSHCOMPLETE {
+			pp.log.Info(
+				"Channel is not flushing or flush complete, skipping upgrade timeout",
+				zap.String("chain_id", pathEndChannelUpgradeMessages.Dst.info.ChainID),
+				zap.String("channel_id", chanKey.ChannelID),
+				zap.String("port_id", chanKey.PortID),
+				zap.String("state", dstChannel.State.String()),
+			)
+			pathEndChannelUpgradeMessages.Dst.upgradeTimeout[chanKey] = time.Time{}
+			continue
+		}
+
+		srcChannel, err := pathEndChannelUpgradeMessages.Src.chainProvider.QueryChannelWithoutProof(ctx, chanKey.CounterpartyChannelID, chanKey.CounterpartyPortID)
+		if err != nil {
+			return pathEndChannelUpgradeResponse{}, err
+		}
+
+		if srcChannel.State != chantypes.FLUSHING && srcChannel.State != chantypes.OPEN {
+			pp.log.Info(
+				"Counterparty channel is not flushing or open, skipping upgrade timeout",
+				zap.String("chain_id", pathEndChannelUpgradeMessages.Dst.info.ChainID),
+				zap.String("channel_id", chanKey.CounterpartyChannelID),
+				zap.String("port_id", chanKey.CounterpartyPortID),
+				zap.String("state", srcChannel.State.String()),
+			)
+			pathEndChannelUpgradeMessages.Dst.upgradeTimeout[chanKey] = time.Time{}
+			continue
+		}
+
+		msgTimeout := channelIBCMessage{
+			eventType: chantypes.EventTypeChannelUpgradeTimeout,
+			info: provider.ChannelInfo{
+				ChannelID:             chanKey.ChannelID,
+				PortID:                chanKey.PortID,
+				CounterpartyChannelID: chanKey.CounterpartyChannelID,
+				CounterpartyPortID:    chanKey.CounterpartyPortID,
+				Height:                pathEndChannelUpgradeMessages.Src.latestBlock.Height,
+			},
+		}
+
+		if pathEndChannelUpgradeMessages.Dst.shouldSendChannelMessage(
+			msgTimeout, pathEndChannelUpgradeMessages.Src, false, // skipping height check because we are sending to the source
+		) {
+			res.DstMessages = append(res.DstMessages, msgTimeout)
+			pathEndChannelUpgradeMessages.Dst.upgradeTimeout[chanKey] = time.Time{}
+		}
+
+		counterpartyKey := chanKey.Counterparty()
+
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeOpen] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeOpen], counterpartyKey,
+		)
+		toDeleteDst[chantypes.EventTypeChannelUpgradeConfirm] = append(
+			toDeleteDst[chantypes.EventTypeChannelUpgradeConfirm], chanKey,
+		)
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeAck] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeAck], counterpartyKey,
+		)
+		toDeleteDst[chantypes.EventTypeChannelUpgradeTry] = append(
+			toDeleteDst[chantypes.EventTypeChannelUpgradeTry], chanKey,
+		)
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeInit] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeInit], counterpartyKey,
+		)
+	}
+
+	processRemovals()
+
+	for chanKey, info := range pathEndChannelUpgradeMessages.SrcMsgChannelUpgradeOpen {
+		delete(pathEndChannelUpgradeMessages.Dst.upgradeTimeout, chanKey.Counterparty())
+
+		if info.CounterpartyChannelState == chantypes.FLUSHCOMPLETE && len(pathEndChannelUpgradeMessages.DstMsgChannelUpgradeConfirm) != 0 {
+			msgOpen := channelIBCMessage{
+				eventType: chantypes.EventTypeChannelUpgradeOpen,
+				info:      info,
+			}
+			if pathEndChannelUpgradeMessages.Dst.shouldSendChannelMessage(
+				msgOpen, pathEndChannelUpgradeMessages.Src, true,
+			) {
+				res.SrcMessages = append(res.SrcMessages, msgOpen)
+			}
+		} else if info.CounterpartyChannelState == chantypes.OPEN || len(pathEndChannelUpgradeMessages.DstMsgChannelUpgradeConfirm) == 0 {
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeOpen] = append(
+				toDeleteSrc[chantypes.EventTypeChannelUpgradeOpen], chanKey,
+			)
+		}
+
+		counterpartyKey := chanKey.Counterparty()
+		toDeleteDst[chantypes.EventTypeChannelUpgradeConfirm] = append(
+			toDeleteDst[chantypes.EventTypeChannelUpgradeConfirm], counterpartyKey,
+		)
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeAck] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeAck], chanKey,
+		)
+		toDeleteDst[chantypes.EventTypeChannelUpgradeTry] = append(
+			toDeleteDst[chantypes.EventTypeChannelUpgradeTry], counterpartyKey,
+		)
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeInit] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeInit], chanKey,
+		)
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeCancel] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeCancel], chanKey,
+		)
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeTimeout] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeTimeout], chanKey,
+		)
+	}
+
+	processRemovals()
+
+	for chanKey, info := range pathEndChannelUpgradeMessages.DstMsgChannelUpgradeConfirm {
+		msgOpen := channelIBCMessage{
+			eventType: chantypes.EventTypeChannelUpgradeOpen,
+			info:      info,
+		}
+		if pathEndChannelUpgradeMessages.Src.shouldSendChannelMessage(
+			msgOpen, pathEndChannelUpgradeMessages.Dst, true,
+		) {
+			res.SrcMessages = append(res.SrcMessages, msgOpen)
+		}
+
+		counterpartyKey := chanKey.Counterparty()
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeAck] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeAck], counterpartyKey,
+		)
+		toDeleteDst[chantypes.EventTypeChannelUpgradeTry] = append(
+			toDeleteDst[chantypes.EventTypeChannelUpgradeTry], chanKey,
+		)
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeInit] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeInit], counterpartyKey,
+		)
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeCancel] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeCancel], counterpartyKey,
+		)
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeTimeout] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeTimeout], counterpartyKey,
+		)
+	}
+
+	processRemovals()
+
+	for chanKey, info := range pathEndChannelUpgradeMessages.SrcMsgChannelUpgradeAck {
+		upgrade, err := pathEndChannelUpgradeMessages.Src.chainProvider.QueryUpgrade(ctx, info.ChannelID, info.PortID)
+		if err != nil {
+			return pathEndChannelUpgradeResponse{}, err
+		} else if _, ok := pathEndChannelUpgradeMessages.Src.upgradeTimeout[chanKey]; !ok {
+			pathEndChannelUpgradeMessages.Src.upgradeTimeout[chanKey] = time.Unix(0, int64(upgrade.Timeout.Timestamp))
+		}
+
+		msgConfirm := channelIBCMessage{
+			eventType: chantypes.EventTypeChannelUpgradeConfirm,
+			info:      info,
+		}
+		if pathEndChannelUpgradeMessages.Dst.shouldSendChannelMessage(
+			msgConfirm, pathEndChannelUpgradeMessages.Src, true,
+		) {
+			res.DstMessages = append(res.DstMessages, msgConfirm)
+		}
+
+		counterpartyKey := chanKey.Counterparty()
+		toDeleteDst[chantypes.EventTypeChannelUpgradeTry] = append(
+			toDeleteDst[chantypes.EventTypeChannelUpgradeTry], counterpartyKey,
+		)
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeInit] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeInit], chanKey,
+		)
+	}
+
+	processRemovals()
+
+	for chanKey, info := range pathEndChannelUpgradeMessages.DstMsgChannelUpgradeTry {
+		upgrade, err := pathEndChannelUpgradeMessages.Dst.chainProvider.QueryUpgrade(ctx, info.ChannelID, info.PortID)
+		if err != nil {
+			return pathEndChannelUpgradeResponse{}, err
+		} else if _, ok := pathEndChannelUpgradeMessages.Dst.upgradeTimeout[chanKey]; !ok {
+			pathEndChannelUpgradeMessages.Dst.upgradeTimeout[chanKey] = time.Unix(0, int64(upgrade.Timeout.Timestamp))
+		}
+
+		msgAck := channelIBCMessage{
+			eventType: chantypes.EventTypeChannelUpgradeAck,
+			info:      info,
+		}
+		if pathEndChannelUpgradeMessages.Src.shouldSendChannelMessage(
+			msgAck, pathEndChannelUpgradeMessages.Dst, true,
+		) {
+			res.SrcMessages = append(res.SrcMessages, msgAck)
+		}
+
+		toDeleteSrc[chantypes.EventTypeChannelUpgradeInit] = append(
+			toDeleteSrc[chantypes.EventTypeChannelUpgradeInit], chanKey.Counterparty(),
+		)
+	}
+
+	processRemovals()
+
+	for _, info := range pathEndChannelUpgradeMessages.SrcMsgChannelUpgradeInit {
+		msgTry := channelIBCMessage{
+			eventType: chantypes.EventTypeChannelUpgradeTry,
+			info:      info,
+		}
+		if pathEndChannelUpgradeMessages.Dst.shouldSendChannelMessage(
+			msgTry, pathEndChannelUpgradeMessages.Src, true,
+		) {
+			res.DstMessages = append(res.DstMessages, msgTry)
+		}
+	}
+
+	processRemovals()
+
+	return res, nil
 }
 
 func (pp *PathProcessor) unrelayedChannelCloseMessages(
@@ -625,7 +1074,7 @@ func (pp *PathProcessor) unrelayedChannelCloseMessages(
 			info:      info,
 		}
 		if pathEndChannelCloseMessages.Dst.shouldSendChannelMessage(
-			msgCloseConfirm, pathEndChannelCloseMessages.Src,
+			msgCloseConfirm, pathEndChannelCloseMessages.Src, true,
 		) {
 			res.DstMessages = append(res.DstMessages, msgCloseConfirm)
 			toDeleteSrc[chantypes.EventTypeChannelCloseInit] = append(
@@ -647,7 +1096,7 @@ func (pp *PathProcessor) unrelayedChannelCloseMessages(
 			info:      info,
 		}
 		if pathEndChannelCloseMessages.Src.shouldSendChannelMessage(
-			msgCloseInit, pathEndChannelCloseMessages.Dst,
+			msgCloseInit, pathEndChannelCloseMessages.Dst, true,
 		) {
 			res.SrcMessages = append(res.SrcMessages, msgCloseInit)
 		}
@@ -728,10 +1177,14 @@ var observedEventTypeForDesiredMessage = map[string]string{
 	conntypes.EventTypeConnectionOpenTry:     conntypes.EventTypeConnectionOpenInit,
 	conntypes.EventTypeConnectionOpenInit:    preInitKey,
 
-	chantypes.EventTypeChannelOpenConfirm: chantypes.EventTypeChannelOpenAck,
-	chantypes.EventTypeChannelOpenAck:     chantypes.EventTypeChannelOpenTry,
-	chantypes.EventTypeChannelOpenTry:     chantypes.EventTypeChannelOpenInit,
-	chantypes.EventTypeChannelOpenInit:    preInitKey,
+	chantypes.EventTypeChannelOpenConfirm:    chantypes.EventTypeChannelOpenAck,
+	chantypes.EventTypeChannelOpenAck:        chantypes.EventTypeChannelOpenTry,
+	chantypes.EventTypeChannelOpenTry:        chantypes.EventTypeChannelOpenInit,
+	chantypes.EventTypeChannelOpenInit:       preInitKey,
+	chantypes.EventTypeChannelUpgradeOpen:    chantypes.EventTypeChannelUpgradeConfirm,
+	chantypes.EventTypeChannelUpgradeConfirm: chantypes.EventTypeChannelUpgradeAck,
+	chantypes.EventTypeChannelUpgradeAck:     chantypes.EventTypeChannelUpgradeTry,
+	chantypes.EventTypeChannelUpgradeTry:     chantypes.EventTypeChannelUpgradeInit,
 
 	chantypes.EventTypeAcknowledgePacket: chantypes.EventTypeRecvPacket,
 	chantypes.EventTypeRecvPacket:        chantypes.EventTypeSendPacket,
@@ -964,6 +1417,39 @@ func (pp *PathProcessor) processLatestMessages(ctx context.Context, cancel func(
 	pathEnd1ChannelHandshakeRes := pp.unrelayedChannelHandshakeMessages(pathEnd1ChannelHandshakeMessages)
 	pathEnd2ChannelHandshakeRes := pp.unrelayedChannelHandshakeMessages(pathEnd2ChannelHandshakeMessages)
 
+	pathEnd1ChannelUpgradeMessages := pathEndChannelUpgradeMessages{
+		Src:                         pp.pathEnd1,
+		Dst:                         pp.pathEnd2,
+		SrcMsgChannelUpgradeInit:    pp.pathEnd1.messageCache.ChannelUpgrade[chantypes.EventTypeChannelUpgradeInit],
+		DstMsgChannelUpgradeTry:     pp.pathEnd2.messageCache.ChannelUpgrade[chantypes.EventTypeChannelUpgradeTry],
+		SrcMsgChannelUpgradeAck:     pp.pathEnd1.messageCache.ChannelUpgrade[chantypes.EventTypeChannelUpgradeAck],
+		DstMsgChannelUpgradeConfirm: pp.pathEnd2.messageCache.ChannelUpgrade[chantypes.EventTypeChannelUpgradeConfirm],
+		SrcMsgChannelUpgradeOpen:    pp.pathEnd1.messageCache.ChannelUpgrade[chantypes.EventTypeChannelUpgradeOpen],
+		SrcMsgChannelUpgradeTimeout: pp.pathEnd1.messageCache.ChannelUpgrade[chantypes.EventTypeChannelUpgradeTimeout],
+		SrcMsgChannelUpgradeCancel:  pp.pathEnd1.messageCache.ChannelUpgrade[chantypes.EventTypeChannelUpgradeCancel],
+		SrcMsgChannelUpgradeError:   pp.pathEnd1.messageCache.ChannelUpgrade[chantypes.EventTypeChannelUpgradeError],
+	}
+	pathEnd2ChannelUpgradeMessages := pathEndChannelUpgradeMessages{
+		Src:                         pp.pathEnd2,
+		Dst:                         pp.pathEnd1,
+		SrcMsgChannelUpgradeInit:    pp.pathEnd2.messageCache.ChannelUpgrade[chantypes.EventTypeChannelUpgradeInit],
+		DstMsgChannelUpgradeTry:     pp.pathEnd1.messageCache.ChannelUpgrade[chantypes.EventTypeChannelUpgradeTry],
+		SrcMsgChannelUpgradeAck:     pp.pathEnd2.messageCache.ChannelUpgrade[chantypes.EventTypeChannelUpgradeAck],
+		DstMsgChannelUpgradeConfirm: pp.pathEnd1.messageCache.ChannelUpgrade[chantypes.EventTypeChannelUpgradeConfirm],
+		SrcMsgChannelUpgradeOpen:    pp.pathEnd2.messageCache.ChannelUpgrade[chantypes.EventTypeChannelUpgradeOpen],
+		SrcMsgChannelUpgradeTimeout: pp.pathEnd2.messageCache.ChannelUpgrade[chantypes.EventTypeChannelUpgradeTimeout],
+		SrcMsgChannelUpgradeCancel:  pp.pathEnd2.messageCache.ChannelUpgrade[chantypes.EventTypeChannelUpgradeCancel],
+		SrcMsgChannelUpgradeError:   pp.pathEnd2.messageCache.ChannelUpgrade[chantypes.EventTypeChannelUpgradeError],
+	}
+	pathEnd1ChannelUpgradeRes, err := pp.unrelayedChannelUpgradeMessages(ctx, pathEnd1ChannelUpgradeMessages)
+	if err != nil {
+		return err
+	}
+	pathEnd2ChannelUpgradeRes, err := pp.unrelayedChannelUpgradeMessages(ctx, pathEnd2ChannelUpgradeMessages)
+	if err != nil {
+		return err
+	}
+
 	// process the packet flows for both path ends to determine what needs to be relayed
 	pathEnd1ProcessRes := make([]pathEndPacketFlowResponse, len(channelPairs))
 	pathEnd2ProcessRes := make([]pathEndPacketFlowResponse, len(channelPairs))
@@ -1034,6 +1520,9 @@ func (pp *PathProcessor) processLatestMessages(ctx context.Context, cancel func(
 		pathEnd1ChannelHandshakeRes, pathEnd2ChannelHandshakeRes,
 		pathEnd1ChannelCloseRes, pathEnd2ChannelCloseRes,
 	)
+	pathEnd1UpgradeMessages, pathEnd2UpgradeMessages := pp.channelUpgradeMessagesToSend(pathEnd1ChannelUpgradeRes, pathEnd2ChannelUpgradeRes)
+	pathEnd1ChannelMessages = append(pathEnd1ChannelMessages, pathEnd1UpgradeMessages...)
+	pathEnd2ChannelMessages = append(pathEnd2ChannelMessages, pathEnd2UpgradeMessages...)
 
 	pathEnd1PacketMessages, pathEnd2PacketMessages, pathEnd1ChanCloseMessages, pathEnd2ChanCloseMessages := pp.packetMessagesToSend(channelPairs, pathEnd1ProcessRes, pathEnd2ProcessRes)
 	pathEnd1ChannelMessages = append(pathEnd1ChannelMessages, pathEnd1ChanCloseMessages...)
@@ -1105,6 +1594,22 @@ func (pp *PathProcessor) channelMessagesToSend(pathEnd1ChannelHandshakeRes, path
 	pathEnd2ChannelMessages = append(pathEnd2ChannelMessages, pathEnd2ChannelCloseRes.SrcMessages...)
 
 	return pathEnd1ChannelMessages, pathEnd2ChannelMessages
+}
+
+func (pp *PathProcessor) channelUpgradeMessagesToSend(pathEnd1ChannelUpgradeRes, pathEnd2ChannelUpgradeRes pathEndChannelUpgradeResponse) ([]channelIBCMessage, []channelIBCMessage) {
+	pathEnd1Len := len(pathEnd1ChannelUpgradeRes.SrcMessages) + len(pathEnd2ChannelUpgradeRes.DstMessages)
+	pathEnd2Len := len(pathEnd2ChannelUpgradeRes.SrcMessages) + len(pathEnd1ChannelUpgradeRes.DstMessages)
+
+	pathEnd1Messages := make([]channelIBCMessage, 0, pathEnd1Len)
+	pathEnd2Messages := make([]channelIBCMessage, 0, pathEnd2Len)
+
+	pathEnd1Messages = append(pathEnd1Messages, pathEnd1ChannelUpgradeRes.SrcMessages...)
+	pathEnd1Messages = append(pathEnd1Messages, pathEnd2ChannelUpgradeRes.DstMessages...)
+
+	pathEnd2Messages = append(pathEnd2Messages, pathEnd2ChannelUpgradeRes.SrcMessages...)
+	pathEnd2Messages = append(pathEnd2Messages, pathEnd1ChannelUpgradeRes.DstMessages...)
+
+	return pathEnd1Messages, pathEnd2Messages
 }
 
 func (pp *PathProcessor) connectionMessagesToSend(pathEnd1ConnectionHandshakeRes, pathEnd2ConnectionHandshakeRes pathEndConnectionHandshakeResponse) ([]connectionIBCMessage, []connectionIBCMessage) {

@@ -38,6 +38,8 @@ const (
 	flagDstPort                        = "dst-port"
 	flagOrder                          = "order"
 	flagVersion                        = "version"
+	flagConnectionHops                 = "connection-hops"
+	flagDeposit                        = "deposit"
 	flagDebugAddr                      = "debug-addr"
 	flagEnableDebugServer              = "enable-debug-server"
 	flagDebugListenAddr                = "debug-listen-addr"
@@ -400,6 +402,14 @@ func orderFlag(v *viper.Viper, cmd *cobra.Command) *cobra.Command {
 func versionFlag(v *viper.Viper, cmd *cobra.Command) *cobra.Command {
 	cmd.Flags().StringP(flagVersion, "v", "ics20-1", "version of channel to create")
 	if err := v.BindPFlag(flagVersion, cmd.Flags().Lookup(flagVersion)); err != nil {
+		panic(err)
+	}
+	return cmd
+}
+
+func connectionHopsFlag(v *viper.Viper, cmd *cobra.Command) *cobra.Command {
+	cmd.Flags().StringArray(flagConnectionHops, []string{}, "connection hops of channel to upgrade")
+	if err := v.BindPFlag(flagConnectionHops, cmd.Flags().Lookup(flagConnectionHops)); err != nil {
 		panic(err)
 	}
 	return cmd

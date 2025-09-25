@@ -146,6 +146,12 @@ func (msg channelIBCMessage) assemble(
 ) (provider.RelayerMessage, error) {
 	var chanProof func(context.Context, provider.ChannelInfo, uint64) (provider.ChannelProof, error)
 	var assembleMessage func(provider.ChannelInfo, provider.ChannelProof) (provider.RelayerMessage, error)
+	var upgradeProof func(context.Context, provider.ChannelInfo, uint64) (provider.ChannelUpgradeProof, error)
+	var upgradeErrorProof func(context.Context, provider.ChannelInfo, uint64) (provider.ChannelUpgradeErrorProof, error)
+	var assembleUpgradeMessage func(provider.ChannelInfo, provider.ChannelUpgradeProof) (provider.RelayerMessage, error)
+	var assembleUpgradeOpenMessage func(provider.ChannelInfo, provider.ChannelProof) (provider.RelayerMessage, error)
+	var assembleUpgradeCancelMessage func(provider.ChannelInfo, provider.ChannelUpgradeErrorProof, string) (provider.RelayerMessage, error)
+
 	switch msg.eventType {
 	case chantypes.EventTypeChannelOpenInit:
 		// don't need proof for this message
@@ -165,11 +171,63 @@ func (msg channelIBCMessage) assemble(
 	case chantypes.EventTypeChannelCloseConfirm:
 		chanProof = src.chainProvider.ChannelProof
 		assembleMessage = dst.chainProvider.MsgChannelCloseConfirm
+	case chantypes.EventTypeChannelUpgradeTry:
+		upgradeProof = src.chainProvider.ChannelUpgradeProof
+		assembleUpgradeMessage = dst.chainProvider.MsgChannelUpgradeTry
+	case chantypes.EventTypeChannelUpgradeAck:
+		upgradeProof = src.chainProvider.ChannelUpgradeProof
+		assembleUpgradeMessage = dst.chainProvider.MsgChannelUpgradeAck
+	case chantypes.EventTypeChannelUpgradeConfirm:
+		upgradeProof = src.chainProvider.ChannelUpgradeProof
+		channel, err := src.chainProvider.QueryChannel(ctx, int64(src.latestBlock.Height), msg.info.ChannelID, msg.info.PortID)
+		if err != nil {
+			return nil, fmt.Errorf("error querying channel: %w", err)
+		}
+		msg.info.ChannelState = channel.Channel.State
+		assembleUpgradeMessage = dst.chainProvider.MsgChannelUpgradeConfirm
+	case chantypes.EventTypeChannelUpgradeOpen:
+		chanProof = src.chainProvider.ChannelProof
+		channel, err := src.chainProvider.QueryChannel(ctx, int64(src.latestBlock.Height), msg.info.ChannelID, msg.info.PortID)
+		if err != nil {
+			return nil, fmt.Errorf("error querying channel: %w", err)
+		}
+		msg.info.ChannelState = channel.Channel.State
+		assembleUpgradeOpenMessage = dst.chainProvider.MsgChannelUpgradeOpen
+	case chantypes.EventTypeChannelUpgradeTimeout:
+		upgradeProof = src.chainProvider.ChannelUpgradeProof
+		assembleUpgradeMessage = dst.chainProvider.MsgChannelUpgradeTimeout
+	case chantypes.EventTypeChannelUpgradeCancel:
+		upgradeErrorProof = src.chainProvider.ChannelUpgradeErrorProof
+		assembleUpgradeCancelMessage = dst.chainProvider.MsgChannelUpgradeCancel
 	default:
 		return nil, fmt.Errorf("unexpected channel message eventType for message assembly: %s", msg.eventType)
 	}
 	if src.clientState.ClientID == ibcexported.LocalhostClientID {
 		chanProof = src.localhostSentinelProofChannel
+	}
+
+	if assembleUpgradeMessage != nil {
+		proof, err := upgradeProof(ctx, msg.info, src.latestBlock.Height)
+		if err != nil {
+			return nil, fmt.Errorf("error querying channel upgrade proof: %w", err)
+		}
+		return assembleUpgradeMessage(msg.info, proof)
+	}
+
+	if assembleUpgradeCancelMessage != nil {
+		proof, err := upgradeErrorProof(ctx, msg.info, src.latestBlock.Height)
+		if err != nil {
+			return nil, fmt.Errorf("error querying channel upgrade proof: %w", err)
+		}
+		return assembleUpgradeCancelMessage(msg.info, proof, "")
+	}
+
+	if assembleUpgradeOpenMessage != nil {
+		proof, err := chanProof(ctx, msg.info, src.latestBlock.Height)
+		if err != nil {
+			return nil, fmt.Errorf("error querying channel proof: %w", err)
+		}
+		return assembleUpgradeOpenMessage(msg.info, proof)
 	}
 
 	var proof provider.ChannelProof
@@ -191,8 +249,19 @@ func (msg channelIBCMessage) tracker(assembled provider.RelayerMessage) messageT
 	}
 }
 
-func (channelIBCMessage) msgType() string {
-	return "channel handshake"
+func (msg channelIBCMessage) msgType() string {
+	switch msg.eventType {
+	case chantypes.EventTypeChannelUpgradeInit,
+		chantypes.EventTypeChannelUpgradeTry,
+		chantypes.EventTypeChannelUpgradeAck,
+		chantypes.EventTypeChannelUpgradeConfirm,
+		chantypes.EventTypeChannelUpgradeOpen,
+		chantypes.EventTypeChannelUpgradeTimeout,
+		chantypes.EventTypeChannelUpgradeCancel:
+		return "channel upgrade"
+	default:
+		return "channel handshake"
+	}
 }
 
 // MarshalLogObject satisfies the zapcore.ObjectMarshaler interface
@@ -562,6 +631,20 @@ type pathEndChannelHandshakeMessages struct {
 	DstMsgChannelOpenConfirm ChannelMessageCache
 }
 
+type pathEndChannelUpgradeMessages struct {
+	Src                         *pathEndRuntime
+	Dst                         *pathEndRuntime
+	SrcMsgChannelUpgradeInit    ChannelMessageCache
+	DstMsgChannelUpgradeTry     ChannelMessageCache
+	SrcMsgChannelUpgradeAck     ChannelMessageCache
+	DstMsgChannelUpgradeConfirm ChannelMessageCache
+	SrcMsgChannelUpgradeOpen    ChannelMessageCache
+	SrcMsgChannelUpgradeTimeout ChannelMessageCache
+	DstMsgChannelUpgradeTimeout ChannelMessageCache
+	SrcMsgChannelUpgradeCancel  ChannelMessageCache
+	SrcMsgChannelUpgradeError   ChannelMessageCache
+}
+
 type pathEndChannelCloseMessages struct {
 	Src                       *pathEndRuntime
 	Dst                       *pathEndRuntime
@@ -578,6 +661,11 @@ type pathEndPacketFlowResponse struct {
 }
 
 type pathEndChannelHandshakeResponse struct {
+	SrcMessages []channelIBCMessage
+	DstMessages []channelIBCMessage
+}
+
+type pathEndChannelUpgradeResponse struct {
 	SrcMessages []channelIBCMessage
 	DstMessages []channelIBCMessage
 }
